@@ -17,6 +17,7 @@ import { displayPath } from "../../../../shared/lib/paths";
 import { normalizeTaskListStatus } from "../../../../features/sessions/model/taskList";
 import {
   composeToolTitle,
+  describeToolInput,
   extractToolPreview,
   formatAgentType,
 } from "../../core/preview";
@@ -733,11 +734,13 @@ function mapToolItem(
   if (!callId) return null;
 
   if (itemType === "commandExecution") {
-    const command = codexCommandText(item) ?? "Shell";
+    const script = codexCommandText(item);
+    const command = script ?? "Shell";
     const status = mapItemStatus(stringField(item, "status"), completed);
     const output =
       stringField(item, "aggregatedOutput") ?? stringField(item, "output");
     const presentation = codexCommandPresentation(item, command);
+    const input = describeToolInput({ command: script }, "execute");
     const eventType = completed ? "tool.updated" : "tool.started";
     if (eventType === "tool.started") {
       return {
@@ -746,6 +749,7 @@ function mapToolItem(
         title: presentation.title,
         kind: "execute",
         status,
+        input,
         preview: presentation.preview,
       };
     }
@@ -756,6 +760,7 @@ function mapToolItem(
       kind: "execute",
       status,
       ...(output ? { detail: output } : {}),
+      input,
       preview: presentation.preview,
     };
   }
@@ -767,6 +772,7 @@ function mapToolItem(
   if (itemType === "webSearch") {
     const query = stringField(item, "query") ?? "Search";
     const status = mapItemStatus(stringField(item, "status"), completed);
+    const input = describeToolInput({ query: stringField(item, "query") });
     if (!completed) {
       return {
         type: "tool.started",
@@ -779,6 +785,7 @@ function mapToolItem(
         }),
         kind: "search",
         status,
+        input,
         preview: { kind: "search", query },
       };
     }
@@ -793,6 +800,7 @@ function mapToolItem(
       }),
       kind: "search",
       status,
+      input,
       preview: { kind: "search", query },
     };
   }
@@ -808,6 +816,7 @@ function mapToolItem(
         { kind: "other", title, rawInput: args },
         { kind: "other", title, rawInput: args },
       ) ?? undefined;
+    const input = describeToolInput(args, "other", title);
     if (!completed) {
       return {
         type: "tool.started",
@@ -815,6 +824,7 @@ function mapToolItem(
         title,
         kind: "other",
         status,
+        input,
         preview,
       };
     }
@@ -824,6 +834,7 @@ function mapToolItem(
       title,
       kind: "other",
       status,
+      input,
       preview,
     };
   }
@@ -1149,6 +1160,7 @@ export function mapCodexSubagentSteps(
             ...(event.kind ? { toolKind: event.kind } : {}),
             ...(event.status ? { status: event.status } : {}),
             ...(detail ? { detail } : {}),
+            ...(event.input ? { input: event.input } : {}),
             ...(event.preview ? { preview: event.preview } : {}),
           },
         ];
@@ -1338,11 +1350,13 @@ export function mapApprovalRequest(
   if (!rec) return null;
 
   if (method === "item/commandExecution/requestApproval") {
-    const command = codexCommandText(rec) ?? "Shell";
+    const script = codexCommandText(rec);
+    const command = script ?? "Shell";
     const callId = stringField(rec, "itemId");
     const reason = stringField(rec, "reason");
     const presentation = codexCommandPresentation(rec, command);
     const readable = presentation.title !== command;
+    const input = describeToolInput({ command: script }, "execute");
     return {
       kind: "command",
       event: {
@@ -1355,6 +1369,7 @@ export function mapApprovalRequest(
             : command,
         kind: "execute",
         callId,
+        input,
         preview: presentation.preview,
       },
     };

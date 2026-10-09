@@ -2919,6 +2919,15 @@ fn validate_agent_proxy_url(raw: &str) -> Result<String, String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// The agent proxy for MonoCode's own requests to agent services, such as
+/// reading usage limits. `None` keeps them direct.
+pub(crate) fn agent_proxy(raw: Option<&str>) -> Result<Option<ureq::Proxy>, String> {
+    raw.map(validate_agent_proxy_url)
+        .transpose()?
+        .map(|url| ureq::Proxy::new(url).map_err(|e| format!("harness: invalid proxy URL: {e}")))
+        .transpose()
+}
+
 /// Points the child's proxy variables, lower- and upper-case, at a validated
 /// proxy. The parent's NO_PROXY/no_proxy entries are preserved and loopback
 /// stays direct; `None` leaves the inherited environment alone.

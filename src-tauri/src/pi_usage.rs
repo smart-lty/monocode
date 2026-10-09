@@ -56,7 +56,11 @@ impl PiUsageProvider {
 }
 
 #[tauri::command]
-pub async fn fetch_pi_usage(provider: PiUsageProvider) -> PiUsageResult {
+pub async fn fetch_pi_usage(provider: PiUsageProvider, proxy_url: Option<String>) -> PiUsageResult {
+    let proxy = match crate::harness::agent_proxy(proxy_url.as_deref()) {
+        Ok(proxy) => proxy,
+        Err(message) => return error(&message),
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let Some(dir) = agent_dir(std::env::var_os("PI_CODING_AGENT_DIR"), crate::dirs_home())
         else {
@@ -65,7 +69,7 @@ pub async fn fetch_pi_usage(provider: PiUsageProvider) -> PiUsageResult {
             );
         };
         read_usage(&dir, provider, |credential| {
-            request_usage(provider, credential, provider.endpoint())
+            request_usage(provider, credential, provider.endpoint(), proxy.clone())
         })
     })
     .await
@@ -207,11 +211,19 @@ fn read_usage(
     }
     result
 }
-fn request_usage(provider: PiUsageProvider, credentials: &PiOAuth, url: &str) -> PiUsageResult {
-    let agent = ureq::AgentBuilder::new()
+fn request_usage(
+    provider: PiUsageProvider,
+    credentials: &PiOAuth,
+    url: &str,
+    proxy: Option<ureq::Proxy>,
+) -> PiUsageResult {
+    let mut agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
-        .redirects(0)
-        .build();
+        .redirects(0);
+    if let Some(proxy) = proxy {
+        agent = agent.proxy(proxy);
+    }
+    let agent = agent.build();
     let mut request = agent
         .get(url)
         .set("Authorization", &format!("Bearer {}", credentials.access))
@@ -537,7 +549,7 @@ mod tests {
             account_id: Some("synthetic-pi-account".into()),
             expires: u64::MAX,
         };
-        let result = request_usage(PiUsageProvider::OpenaiCodex, &creds, &url);
+        let result = request_usage(PiUsageProvider::OpenaiCodex, &creds, &url, None);
         assert!(matches!(result, PiUsageResult::Ok { .. }));
         let request = worker.join().unwrap().to_lowercase();
         assert!(request.contains("authorization: bearer synthetic-pi-token\r\n"));
@@ -545,6 +557,26 @@ mod tests {
         assert!(!serde_json::to_string(&result)
             .unwrap()
             .contains("synthetic"));
+    }
+
+    #[test]
+    fn usage_requests_go_through_the_agent_proxy() {
+        let (proxy_url, worker) = serve("200 OK", "", r#"{"rate_limit":{}}"#.into());
+        let proxy =
+            crate::harness::agent_proxy(Some(proxy_url.trim_end_matches("/usage"))).unwrap();
+        let creds = PiOAuth {
+            access: "synthetic-pi-token".into(),
+            account_id: None,
+            expires: u64::MAX,
+        };
+        request_usage(
+            PiUsageProvider::OpenaiCodex,
+            &creds,
+            "http://pi-usage.invalid/usage",
+            proxy,
+        );
+        let request = worker.join().unwrap();
+        assert!(request.starts_with("GET http://pi-usage.invalid/usage "));
     }
 
     #[test]
@@ -561,7 +593,7 @@ mod tests {
             account_id: None,
             expires: u64::MAX,
         };
-        let result = request_usage(PiUsageProvider::Anthropic, &creds, &url);
+        let result = request_usage(PiUsageProvider::Anthropic, &creds, &url, None);
         assert!(matches!(result, PiUsageResult::Error { .. }));
         assert_eq!(
             target.accept().unwrap_err().kind(),
@@ -569,7 +601,7 @@ mod tests {
         );
         worker.join().unwrap();
         let (url, worker) = serve("401 Unauthorized", "", "private upstream detail".into());
-        let result = request_usage(PiUsageProvider::Anthropic, &creds, &url);
+        let result = request_usage(PiUsageProvider::Anthropic, &creds, &url, None);
         assert!(matches!(result, PiUsageResult::Unavailable { .. }));
         assert!(!serde_json::to_string(&result)
             .unwrap()
@@ -594,7 +626,7 @@ mod tests {
             expires: u64::MAX,
         };
         assert!(matches!(
-            request_usage(PiUsageProvider::Anthropic, &creds, &url),
+            request_usage(PiUsageProvider::Anthropic, &creds, &url, None),
             PiUsageResult::Error { .. }
         ));
         worker.join().unwrap();

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { loadAgentProxyUrl } from "./agentProxy";
 import { asRecord } from "../../../integrations/harness/providers/codex/codexProtocol";
 import { parsePiModelRef } from "../../../integrations/harness/providers/pi/piProtocol";
 import {
@@ -31,9 +32,13 @@ export async function fetchPiUsage(
   provider: PiUsageProvider,
 ): Promise<ProviderRateLimits> {
   const billingProvider = piBillingProvider(provider);
+  const proxyUrl = loadAgentProxyUrl();
   try {
     const result = asRecord(
-      await invoke<unknown>("fetch_pi_usage", { provider }),
+      await invoke<unknown>("fetch_pi_usage", {
+        provider,
+        ...(proxyUrl ? { proxyUrl } : {}),
+      }),
     );
     if (
       result?.status === "unavailable" &&

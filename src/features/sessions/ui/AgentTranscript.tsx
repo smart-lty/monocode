@@ -63,6 +63,7 @@ import {
 } from "../../../integrations/harness/core/authSupport";
 import {
   isEditTool,
+  isExecuteTool,
   isReadTool,
   isSearchTool,
   stubFilePreview,
@@ -132,6 +133,7 @@ import {
   subagentReport,
   toolCallInput,
   toolCallLabel,
+  commandIcon,
   toolCallState,
   turnCopyText,
   workKind,
@@ -4031,13 +4033,22 @@ function ActivityThinkingRow({
       strokeWidth={1.75}
     />
   );
-  const label = (
+  const summary = proseSummary(block.text);
+  // The opened thought starts with the summary, so an open row names it only.
+  const label = (withSummary: boolean) => (
     <span
-      className={`min-w-0 flex-1 truncate font-sans text-sm text-content/50 ${
+      className={`flex min-w-0 flex-1 items-center gap-1.5 font-sans text-sm ${
         bare ? pulse : ""
       }`}
     >
-      {text}
+      <span className="shrink-0 text-content/50">
+        {block.streaming ? "Thinking" : "Thought"}
+      </span>
+      {withSummary && summary ? (
+        <span className="-my-0.5 min-w-0 truncate rounded bg-content/6 px-1.5 py-0.5 text-content/60 transition-colors duration-200 group-hover:text-content/80">
+          {summary}
+        </span>
+      ) : null}
     </span>
   );
 
@@ -4048,7 +4059,7 @@ function ActivityThinkingRow({
         className="flex min-w-0 items-center gap-1.5 py-1"
       >
         {icon}
-        {label}
+        {label(true)}
       </div>
     );
   }
@@ -4063,14 +4074,7 @@ function ActivityThinkingRow({
         className="group flex min-w-0 items-center gap-1.5 py-1 text-left"
       >
         {icon}
-        <span
-          className={`min-w-0 flex-1 truncate font-sans text-sm text-content/50 transition-colors duration-200 group-hover:text-content/75 ${
-            bare ? pulse : ""
-          }`}
-        >
-          {/* Open, the body starts with the paragraph the summary came from. */}
-          {open ? "Thinking" : text}
-        </span>
+        {label(!open)}
       </button>
       {open ? (
         <div className={`min-w-0 pb-2 ${bare ? "" : "pl-5"}`}>
@@ -4184,8 +4188,20 @@ function ActivityToolRow({
   const state = toolCallState(block);
   const errorDetail =
     !pending && state === "rejected" ? block.tool?.detail?.trim() : undefined;
+  const shell = isExecuteTool(block.tool?.kind, block.text || block.tool?.title);
+  const verb = !shell
+    ? undefined
+    : pending
+      ? "Run"
+      : state === "pending"
+        ? "Running"
+        : "Ran";
+  const output =
+    shell && !errorDetail
+      ? block.tool?.detail?.trim() || block.tool?.preview?.output?.trim()
+      : undefined;
   // Waiting on approval, the full command is already open above the buttons.
-  const expandable = !pending && (!!errorDetail || !!callInput);
+  const expandable = !pending && (!!errorDetail || !!callInput || !!output);
   const toggle = () => setOpen((value) => !value);
 
   return (
@@ -4207,6 +4223,7 @@ function ActivityToolRow({
             chip={bare}
             failed={state === "rejected"}
             status={state}
+            verb={verb}
             onOpenFile={onOpenFile}
             onOpenDiff={onOpenDiff}
           />
@@ -4241,6 +4258,14 @@ function ActivityToolRow({
               className="max-h-64 min-w-0 cursor-text select-text overflow-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-5 text-content/50"
             >
               {callInput}
+            </pre>
+          ) : null}
+          {output ? (
+            <pre
+              aria-label="Command output"
+              className="max-h-64 min-w-0 cursor-text select-text overflow-auto whitespace-pre-wrap break-words rounded bg-content/4 px-2 py-1 font-mono text-[12px] leading-5 text-content/60"
+            >
+              {output}
             </pre>
           ) : null}
           {errorDetail ? (
@@ -4596,6 +4621,7 @@ function ToolCallSummary({
   chip = false,
   failed = false,
   status = "accepted",
+  verb,
 }: {
   label: string;
   preview?: ToolPreview;
@@ -4607,9 +4633,30 @@ function ToolCallSummary({
   chip?: boolean;
   failed?: boolean;
   status?: ToolCallState;
+  /** For a shell command with no readable summary: shown before it in a chip. */
+  verb?: string;
 }) {
   const { action, target, fileName, filePath, isFile, previewMatchesFile } =
     resolveToolCallDisplay(label, preview, cwd);
+  if ((!action || !target) && verb) {
+    const tone = failed ? "text-red-400" : "text-content/70";
+    return (
+      <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-[13px]">
+        <span
+          className={`shrink-0 font-sans text-sm ${failed ? "text-red-400" : "text-content/50"}`}
+        >
+          {verb}
+        </span>
+        <span
+          className={`-my-0.5 flex min-w-0 max-w-full items-center gap-1 rounded bg-content/6 px-1 py-0.5 ${tone}`}
+          title={label}
+        >
+          <FileTypeIcon name="" icon={commandIcon(label)} isDir={false} />
+          <span className="min-w-0 truncate">{label}</span>
+        </span>
+      </span>
+    );
+  }
   if (!action || !target) {
     return (
       <span

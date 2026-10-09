@@ -795,7 +795,7 @@ it("does not repeat a thought's first paragraph above it once opened", () => {
   act(() => row.click());
 
   expect(row.getAttribute("aria-label")).toBe("Hide thinking");
-  expect(row.textContent).toBe("Thinking");
+  expect(row.textContent).toBe("Thought");
   expect(container.textContent?.split("Check the config first.")).toHaveLength(
     2,
   );

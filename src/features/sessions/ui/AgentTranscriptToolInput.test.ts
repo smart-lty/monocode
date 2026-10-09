@@ -85,6 +85,32 @@ describe("tool call disclosure", () => {
     expect(container.querySelector('pre[aria-label="Full tool call"]')).toBeNull();
   });
 
+  it("names a finished command and opens onto its output", () => {
+    render([
+      { id: "user", role: "user", text: "Status" },
+      {
+        ...shellBlock("st", "git status", "git status"),
+        tool: {
+          kind: "execute",
+          status: "completed",
+          input: "git status",
+          detail: "On branch personal\nnothing to commit",
+        },
+      },
+    ]);
+
+    const row = container.querySelector<HTMLElement>('[aria-label^="Tool call:"]');
+    expect(row?.textContent).toBe("Rangit status");
+    act(() =>
+      container
+        .querySelector<HTMLButtonElement>('button[aria-label^="Show call details for"]')!
+        .click(),
+    );
+    expect(
+      container.querySelector('pre[aria-label="Command output"]')?.textContent,
+    ).toBe("On branch personal\nnothing to commit");
+  });
+
   it("keeps a call that fits on its row quiet", () => {
     render([
       { id: "user", role: "user", text: "Status" },

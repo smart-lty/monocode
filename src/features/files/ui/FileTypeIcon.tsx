@@ -2,6 +2,8 @@ import { memo, useMemo, useSyncExternalStore } from "react";
 
 type Props = {
   name: string;
+  /** A Material icon to show by name, instead of one resolved from `name`. */
+  icon?: string;
   isDir: boolean;
   isOpen?: boolean;
   isRoot?: boolean;
@@ -43,6 +45,7 @@ function getSnapshot() {
 /** Filename maps to the matching Material Icon Theme icon. */
 export const FileTypeIcon = memo(function FileTypeIcon({
   name,
+  icon,
   isDir,
   isOpen = false,
   isRoot = false,
@@ -51,9 +54,11 @@ export const FileTypeIcon = memo(function FileTypeIcon({
   const icons = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const iconName = icons
-    ? isDir
-      ? icons.getFolderIcon({ folderName: name, isOpen, isRoot })
-      : resolveFileIcon(icons, name)
+    ? icon
+      ? icon
+      : isDir
+        ? icons.getFolderIcon({ folderName: name, isOpen, isRoot })
+        : resolveFileIcon(icons, name)
     : "";
   const svg = icons?.getIconSvg(iconName) ?? "";
   // React compares this prop by identity. A fresh object replaces the SVG

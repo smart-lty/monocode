@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Block } from "./session";
 import { INTERRUPT_MESSAGE } from "./inFlight";
 import {
+  commandIcon,
   activityPhaseTitle,
   activityStillRunning,
   buildActivityPhases,
@@ -2033,5 +2034,14 @@ describe("isIncompleteTool", () => {
     expect(
       isIncompleteTool({ ...block, approval: { requestId: 1 } }, "Tool", "pending"),
     ).toBe(false);
+  });
+});
+
+describe("commandIcon", () => {
+  it("picks the icon by the program a command starts with", () => {
+    expect(commandIcon("git status --short")).toBe("git");
+    expect(commandIcon("sudo FOO=1 /usr/bin/npm test")).toBe("npm");
+    expect(commandIcon("pwd && ls -la")).toBe("folder");
+    expect(commandIcon("echo hi")).toBe("console");
   });
 });

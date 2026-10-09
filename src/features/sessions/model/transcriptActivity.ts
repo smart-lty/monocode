@@ -82,6 +82,61 @@ export function toolCallLabel(block: Block, cwd?: string): string {
   );
 }
 
+const COMMAND_ICONS: Record<string, string> = {
+  git: "git",
+  npm: "npm",
+  npx: "npm",
+  node: "nodejs",
+  yarn: "yarn",
+  pnpm: "pnpm",
+  bun: "bun",
+  bunx: "bun",
+  deno: "deno",
+  python: "python",
+  python3: "python",
+  pip: "python",
+  pip3: "python",
+  uv: "python",
+  pytest: "python",
+  cargo: "rust",
+  rustc: "rust",
+  rustup: "rust",
+  docker: "docker",
+  go: "go",
+  make: "makefile",
+  java: "java",
+  gradle: "gradle",
+  ruby: "ruby",
+  gem: "ruby",
+  swift: "swift",
+  tsc: "typescript",
+  claude: "claude",
+  ls: "folder",
+  cd: "folder",
+  pwd: "folder",
+  find: "folder",
+  tree: "folder",
+  mkdir: "folder",
+  cat: "document",
+  head: "document",
+  tail: "document",
+  less: "document",
+  wc: "document",
+  grep: "search",
+  rg: "search",
+  curl: "http",
+  wget: "http",
+};
+
+/** The Material icon for a shell command, by the program it starts with. */
+export function commandIcon(command: string): string {
+  const words = command.trim().split(/\s+/);
+  const program = words.find(
+    (word) => word !== "sudo" && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word),
+  );
+  return COMMAND_ICONS[program?.split("/").pop() ?? ""] ?? "console";
+}
+
 /**
  * Whether the row's label is MonoCode's readable summary of the call rather
  * than the call itself: `ls -la /usr/bin | head -80` reads "List /usr/bin",

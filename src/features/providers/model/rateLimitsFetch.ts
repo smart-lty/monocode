@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { loadAgentProxyUrl } from "./agentProxy";
 import { homeDir } from "../../../platform/tauri/fs";
 import {
   errorRateLimits,
@@ -85,8 +86,10 @@ export async function fetchClaudeRateLimits(
   accountId = "default",
 ): Promise<ProviderRateLimits> {
   try {
+    const proxyUrl = loadAgentProxyUrl();
     const result = await invoke<ClaudeUsageFetch>("fetch_claude_usage", {
       accountId,
+      ...(proxyUrl ? { proxyUrl } : {}),
     });
     if (result.status === "ok" && result.body) {
       const parsed = parseClaudeOAuthUsage(result.body);

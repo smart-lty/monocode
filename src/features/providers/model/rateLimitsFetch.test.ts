@@ -51,7 +51,11 @@ vi.mock("../../../integrations/harness/core/jsonRpc", () => ({
   },
 }));
 
-import { fetchCodexRateLimits } from "./rateLimitsFetch";
+import { invoke } from "@tauri-apps/api/core";
+import { loadAgentProxyUrl } from "./agentProxy";
+vi.mock("./agentProxy", () => ({ loadAgentProxyUrl: vi.fn(() => null) }));
+
+import { fetchClaudeRateLimits, fetchCodexRateLimits } from "./rateLimitsFetch";
 
 describe("fetchCodexRateLimits", () => {
   beforeEach(() => {
@@ -76,5 +80,22 @@ describe("fetchCodexRateLimits", () => {
     expect(results.map((result) => result.session?.usedPercent)).toEqual([
       10, 10, 10,
     ]);
+  });
+});
+
+describe("usage proxy forwarding", () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+    vi.mocked(loadAgentProxyUrl).mockReturnValue(null);
+  });
+
+  it.each([null, "http://127.0.0.1:7897"])("forwards the configured Claude proxy: %s", async (proxyUrl) => {
+    vi.mocked(loadAgentProxyUrl).mockReturnValue(proxyUrl);
+    vi.mocked(invoke).mockResolvedValue({ status: "unavailable" });
+    await fetchClaudeRateLimits("work");
+    expect(invoke).toHaveBeenCalledWith("fetch_claude_usage", {
+      accountId: "work",
+      ...(proxyUrl ? { proxyUrl } : {}),
+    });
   });
 });

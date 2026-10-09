@@ -4,6 +4,13 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { announceUpdateAvailable } from "../../features/settings/model/sounds";
 import { rememberInstalledUpdate } from "./updateNotice";
+import { loadAgentProxyUrl } from "../../features/providers/model/agentProxy";
+
+/** Updates follow the agent proxy, when one is set, like usage requests. */
+function updateCheckOptions() {
+  const proxy = loadAgentProxyUrl();
+  return proxy ? { proxy } : undefined;
+}
 
 export type UpdaterPhase =
   | "idle"
@@ -77,7 +84,7 @@ export async function probeForUpdate(): Promise<Update | null> {
     pendingUpdate = null;
     return null;
   }
-  const update = await check();
+  const update = await check(updateCheckOptions());
   pendingUpdate = update;
   if (update) announceUpdateAvailable(update.version);
   return update;
@@ -109,7 +116,7 @@ export async function runUpdateFlow(
   }
 
   try {
-    const update = await check();
+    const update = await check(updateCheckOptions());
     if (!update) {
       pendingUpdate = null;
       const current: UpdaterSnapshot = { phase: "current", currentVersion };

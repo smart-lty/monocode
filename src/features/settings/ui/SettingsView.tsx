@@ -3277,7 +3277,7 @@ function ProvidersPage({
       <Group
         id="agent-proxy"
         title="Agent proxy"
-        description="Only new local AI CLI processes use this proxy. Restart running sessions to apply a change; remote machines keep their own network settings."
+        description="New local AI CLI processes, usage requests, and update checks use this proxy. Restart running sessions to apply a change; remote machines keep their own network settings."
       >
         <Row
           label="HTTP(S) proxy"

@@ -1,9 +1,12 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { loadAgentProxyUrl } from "./agentProxy";
+vi.mock("./agentProxy", () => ({ loadAgentProxyUrl: vi.fn(() => null) }));
 import { fetchPiUsage, piUsageProvider } from "./piUsage";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
+  vi.mocked(loadAgentProxyUrl).mockReturnValue(null);
 });
 
 it("matches only concrete Pi models from supported billing providers", () => {
@@ -85,4 +88,14 @@ it("does not expose transport errors in the UI", async () => {
   const result = await fetchPiUsage("anthropic");
   expect(result.status).toBe("error");
   expect(JSON.stringify(result)).not.toContain("secret-like");
+});
+
+it("routes Pi usage through the configured proxy without changing the billing provider", async () => {
+  vi.mocked(loadAgentProxyUrl).mockReturnValue("http://127.0.0.1:7897");
+  vi.mocked(invoke).mockResolvedValue({ status: "unavailable" });
+  await fetchPiUsage("anthropic");
+  expect(invoke).toHaveBeenCalledExactlyOnceWith("fetch_pi_usage", {
+    provider: "anthropic",
+    proxyUrl: "http://127.0.0.1:7897",
+  });
 });

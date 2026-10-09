@@ -402,14 +402,19 @@ fn usage_result(
 pub async fn fetch_claude_usage(
     app: AppHandle,
     account_id: Option<String>,
+    proxy_url: Option<String>,
 ) -> Result<ClaudeUsageFetch, String> {
     let config_dir = crate::harness::provider_account_dir(&app, "claude", account_id.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || fetch_claude_usage_sync(config_dir))
+    let proxy = crate::harness::agent_proxy(proxy_url.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || fetch_claude_usage_sync(config_dir, proxy))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn fetch_claude_usage_sync(config_dir: Option<PathBuf>) -> Result<ClaudeUsageFetch, String> {
+fn fetch_claude_usage_sync(
+    config_dir: Option<PathBuf>,
+    proxy: Option<ureq::Proxy>,
+) -> Result<ClaudeUsageFetch, String> {
     let Some(creds) = read_claude_credentials(config_dir.as_deref()) else {
         return Ok(usage_result(
             "unavailable",
@@ -427,11 +432,15 @@ fn fetch_claude_usage_sync(config_dir: Option<PathBuf>) -> Result<ClaudeUsageFet
         return Ok(usage_error(401));
     }
 
-    Ok(fetch_usage_with_token(&creds.access_token))
+    Ok(fetch_usage_with_token(&creds.access_token, proxy))
 }
 
-fn fetch_usage_with_token(token: &str) -> ClaudeUsageFetch {
-    let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
+fn fetch_usage_with_token(token: &str, proxy: Option<ureq::Proxy>) -> ClaudeUsageFetch {
+    let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
+    if let Some(proxy) = proxy {
+        agent = agent.proxy(proxy);
+    }
+    let agent = agent.build();
     let result = agent
         .get(OAUTH_USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))

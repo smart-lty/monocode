@@ -50,6 +50,7 @@ export type PiExtensionUiRequest =
       method: "select";
       title: string;
       options: string[];
+      timeout?: number;
     }
   | {
       id: string;
@@ -61,6 +62,9 @@ export type PiExtensionUiRequest =
       id: string;
       method: "input" | "editor";
       title: string;
+      placeholder?: string;
+      prefill?: string;
+      timeout?: number;
     }
   | {
       id: string;
@@ -276,6 +280,7 @@ export function parseExtensionUiRequest(
   const id = stringField(rec, "id");
   const method = stringField(rec, "method");
   if (!id || !method) return null;
+  const timeout = positiveTimeout(rec.timeout);
   if (method === "select") {
     const options = Array.isArray(rec.options)
       ? rec.options.filter((item): item is string => typeof item === "string")
@@ -285,6 +290,7 @@ export function parseExtensionUiRequest(
       method,
       title: stringField(rec, "title") ?? "Choose an option",
       options,
+      ...(timeout !== undefined ? { timeout } : {}),
     };
   }
   if (method === "confirm") {
@@ -296,7 +302,14 @@ export function parseExtensionUiRequest(
     };
   }
   if (method === "input" || method === "editor") {
-    return { id, method, title: stringField(rec, "title") ?? method };
+    return {
+      id,
+      method,
+      title: stringField(rec, "title") ?? method,
+      placeholder: stringField(rec, "placeholder"),
+      prefill: typeof rec.prefill === "string" ? rec.prefill : undefined,
+      ...(timeout !== undefined ? { timeout } : {}),
+    };
   }
   if (
     method === "notify" ||
@@ -319,6 +332,12 @@ export function parseExtensionUiRequest(
     };
   }
   return null;
+}
+
+function positiveTimeout(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : undefined;
 }
 
 export function extensionUiResponse(

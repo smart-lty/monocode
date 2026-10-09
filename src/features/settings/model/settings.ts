@@ -298,6 +298,30 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "fonts custom family typeface monospace snippets editor diff typography",
   },
   {
+    id: "reply-bold-color",
+    section: "appearance",
+    label: "Bold",
+    keywords: "bold strong text color reply markdown",
+  },
+  {
+    id: "reply-italic-color",
+    section: "appearance",
+    label: "Italic",
+    keywords: "italic emphasis text color reply markdown",
+  },
+  {
+    id: "reply-heading-color",
+    section: "appearance",
+    label: "Headings",
+    keywords: "heading title text color reply markdown",
+  },
+  {
+    id: "reply-code-color",
+    section: "appearance",
+    label: "Inline code",
+    keywords: "inline code text color reply markdown",
+  },
+  {
     id: "hue",
     section: "appearance",
     label: "Hue",

@@ -63,12 +63,8 @@
   --color-accent: hsl(211 92% 62%);
   --color-skill: #e8c547;
   --color-mention: #38bdf8;
-  --font-mono:
-    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  --font-sans:
-    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-    Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+  --font-mono: var(--font-mono-default);
+  --font-sans: var(--font-sans-default);
   /* Diff colors. `diff-add`/`diff-del` are the solid marker hues, `-fg` is
      readable text on the theme background, `-bg`/`-gutter` are row tints.
      Palettes below swap them; diff UI must also show a +/- glyph so color is
@@ -97,6 +93,15 @@
     var(--color-diff-del) 25%,
     transparent
   );
+}
+
+:root {
+  --font-mono-default:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --font-sans-default:
+    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
 }
 
 /* Static so Tailwind always emits it: only xterm reads it, via JS. */

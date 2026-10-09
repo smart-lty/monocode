@@ -3,6 +3,7 @@ import { hslToRgb, isHexColor, type Rgb } from "../../../shared/lib/colorUtils";
 import { IS_LINUX, IS_MAC } from "../../../platform/tauri/platform";
 import { readFlag, writeFlag } from "./storageFlags";
 import { applyUiScale, loadUiScale } from "./uiScale";
+import { initFonts } from "./fonts";
 import {
   applyPreparedNewThreadBackground,
   clearPreparedNewThreadBackground,
@@ -310,6 +311,7 @@ export function applyThemeTint(hue: number, saturation: number) {
 }
 
 export function initAppearance() {
+  initFonts();
   document.documentElement.classList.toggle("is-mac", IS_MAC);
   applyAccentColor(loadAccentColor());
   applyThemeTint(loadThemeHue(), loadThemeSaturation());

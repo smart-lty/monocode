@@ -286,6 +286,18 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
       "colorblind color blind accessibility added removed red green blue orange high contrast changes",
   },
   {
+    id: "ui-font-family",
+    section: "appearance",
+    label: "UI font",
+    keywords: "fonts custom family typeface menus chat text sans typography",
+  },
+  {
+    id: "code-font-family",
+    section: "appearance",
+    label: "Code font",
+    keywords: "fonts custom family typeface monospace snippets editor diff typography",
+  },
+  {
     id: "hue",
     section: "appearance",
     label: "Hue",

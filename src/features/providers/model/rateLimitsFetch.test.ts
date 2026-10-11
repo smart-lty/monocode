@@ -55,7 +55,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadAgentProxyUrl } from "./agentProxy";
 vi.mock("./agentProxy", () => ({ loadAgentProxyUrl: vi.fn(() => null) }));
 
-import { fetchClaudeRateLimits, fetchCodexRateLimits } from "./rateLimitsFetch";
+import { fetchClaudeRateLimits, fetchCodexRateLimits, fetchOpencodeGoRateLimits } from "./rateLimitsFetch";
 
 describe("fetchCodexRateLimits", () => {
   beforeEach(() => {
@@ -97,5 +97,15 @@ describe("usage proxy forwarding", () => {
       accountId: "work",
       ...(proxyUrl ? { proxyUrl } : {}),
     });
+  });
+});
+
+it("routes OpenCode Go usage through the configured proxy", async () => {
+  vi.mocked(invoke).mockReset();
+  vi.mocked(invoke).mockResolvedValue({ status: "unavailable" });
+  vi.mocked(loadAgentProxyUrl).mockReturnValue("http://127.0.0.1:7897");
+  await fetchOpencodeGoRateLimits();
+  expect(invoke).toHaveBeenCalledWith("fetch_opencode_go_usage", {
+    proxyUrl: "http://127.0.0.1:7897",
   });
 });

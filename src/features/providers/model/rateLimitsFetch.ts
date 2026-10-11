@@ -37,7 +37,11 @@ type OpencodeGoUsageFetch = {
 export async function fetchOpencodeGoRateLimits(): Promise<ProviderRateLimits> {
   let result: OpencodeGoUsageFetch;
   try {
-    result = await invoke<OpencodeGoUsageFetch>("fetch_opencode_go_usage");
+    const proxyUrl = loadAgentProxyUrl();
+    result = await invoke<OpencodeGoUsageFetch>(
+      "fetch_opencode_go_usage",
+      proxyUrl ? { proxyUrl } : undefined,
+    );
   } catch (error) {
     return errorRateLimits(
       "opencode",

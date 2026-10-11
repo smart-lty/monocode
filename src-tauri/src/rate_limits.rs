@@ -47,8 +47,11 @@ const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 /// Runs in the host process so the webview CORS policy does not apply.
 /// The key never leaves the host process.
 #[tauri::command]
-pub async fn fetch_opencode_go_usage() -> Result<OpencodeGoUsageFetch, String> {
-    tauri::async_runtime::spawn_blocking(fetch_opencode_go_usage_sync)
+pub async fn fetch_opencode_go_usage(
+    proxy_url: Option<String>,
+) -> Result<OpencodeGoUsageFetch, String> {
+    let proxy = crate::harness::agent_proxy(proxy_url.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || fetch_opencode_go_usage_sync(proxy))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -67,7 +70,9 @@ fn opencode_go_result(
     }
 }
 
-fn fetch_opencode_go_usage_sync() -> Result<OpencodeGoUsageFetch, String> {
+fn fetch_opencode_go_usage_sync(
+    proxy: Option<ureq::Proxy>,
+) -> Result<OpencodeGoUsageFetch, String> {
     let Some(api_key) = read_opencode_go_api_key() else {
         return Ok(opencode_go_result(
             "unavailable",
@@ -76,7 +81,11 @@ fn fetch_opencode_go_usage_sync() -> Result<OpencodeGoUsageFetch, String> {
             Some("OpenCode Go not connected".into()),
         ));
     };
-    let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
+    let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
+    if let Some(proxy) = proxy {
+        agent = agent.proxy(proxy);
+    }
+    let agent = agent.build();
     let result = agent
         .get(OPENCODE_GO_USAGE_URL)
         .set("Authorization", &format!("Bearer {api_key}"))

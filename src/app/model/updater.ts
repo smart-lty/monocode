@@ -1,4 +1,5 @@
 import { BundleType, getBundleType, getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
@@ -6,9 +7,11 @@ import { announceUpdateAvailable } from "../../features/settings/model/sounds";
 import { rememberInstalledUpdate } from "./updateNotice";
 import { loadAgentProxyUrl } from "../../features/providers/model/agentProxy";
 
-/** Updates follow the agent proxy, when one is set, like usage requests. */
-function updateCheckOptions() {
-  const proxy = loadAgentProxyUrl();
+/** Prefer the configured proxy, otherwise let the native side resolve the fallback. */
+async function updateCheckOptions() {
+  const proxy =
+    loadAgentProxyUrl() ??
+    (await invoke<string | null>("system_proxy_url").catch(() => null));
   return proxy ? { proxy } : undefined;
 }
 
@@ -84,7 +87,7 @@ export async function probeForUpdate(): Promise<Update | null> {
     pendingUpdate = null;
     return null;
   }
-  const update = await check(updateCheckOptions());
+  const update = await check(await updateCheckOptions());
   pendingUpdate = update;
   if (update) announceUpdateAvailable(update.version);
   return update;
@@ -116,7 +119,7 @@ export async function runUpdateFlow(
   }
 
   try {
-    const update = await check(updateCheckOptions());
+    const update = await check(await updateCheckOptions());
     if (!update) {
       pendingUpdate = null;
       const current: UpdaterSnapshot = { phase: "current", currentVersion };

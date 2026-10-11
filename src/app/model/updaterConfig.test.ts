@@ -1,14 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { getVersion, getBundleType, check, message, ask, relaunch } = vi.hoisted(() => ({
+const { getVersion, getBundleType, check, message, ask, relaunch, invoke } = vi.hoisted(() => ({
   getVersion: vi.fn(),
   getBundleType: vi.fn(),
   check: vi.fn(),
   message: vi.fn(),
   ask: vi.fn(),
   relaunch: vi.fn(),
+  invoke: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion,
   getBundleType,
@@ -19,11 +21,16 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ ask, message }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch }));
 vi.mock("../../features/settings/model/sounds", () => ({ announceUpdateAvailable: vi.fn() }));
 
+import { loadAgentProxyUrl } from "../../features/providers/model/agentProxy";
+vi.mock("../../features/providers/model/agentProxy", () => ({ loadAgentProxyUrl: vi.fn(() => null) }));
+
 import { packageManagerHint, probeForUpdate, runUpdateFlow } from "./updater";
 
 describe("updater", () => {
   beforeEach(() => {
     getBundleType.mockResolvedValue("appimage");
+    invoke.mockResolvedValue(null);
+    vi.mocked(loadAgentProxyUrl).mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -102,12 +109,15 @@ describe("updater", () => {
   it("still checks the feed for AppImage installs", async () => {
     getVersion.mockResolvedValue("0.9.0");
     check.mockResolvedValue(null);
+    invoke.mockResolvedValue("http://127.0.0.1:7897");
 
     await expect(runUpdateFlow(false)).resolves.toEqual({
       phase: "current",
       currentVersion: "0.9.0",
     });
     expect(check).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledWith("system_proxy_url");
+    expect(check).toHaveBeenCalledWith({ proxy: "http://127.0.0.1:7897" });
   });
 
   it("treats a feed without this platform as unavailable, not as a failure", async () => {
@@ -127,4 +137,20 @@ describe("updater", () => {
       { title: "MonoCode" },
     );
   });
+  it("prefers the configured updater proxy over the system fallback", async () => {
+    vi.mocked(loadAgentProxyUrl).mockReturnValue("http://configured.example:8080");
+    invoke.mockResolvedValue("http://system.example:8080");
+    check.mockResolvedValue(null);
+    await probeForUpdate();
+    expect(check).toHaveBeenCalledWith({ proxy: "http://configured.example:8080" });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps native updater behavior when system proxy lookup fails", async () => {
+    invoke.mockRejectedValue(new Error("scutil unavailable"));
+    check.mockResolvedValue(null);
+    await probeForUpdate();
+    expect(check).toHaveBeenCalledWith(undefined);
+  });
+
 });

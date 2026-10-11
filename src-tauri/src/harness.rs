@@ -2896,7 +2896,7 @@ fn prepare_child(cmd: &mut Command, command: &str) {
 /// Userinfo would persist in the saved setting and reappear in the child
 /// environment; a path, query, or fragment is not a proxy address. Returns
 /// the normalized origin.
-fn validate_agent_proxy_url(raw: &str) -> Result<String, String> {
+pub(crate) fn validate_agent_proxy_url(raw: &str) -> Result<String, String> {
     if raw.len() > 256 {
         return Err("harness: proxy URL is too long".into());
     }
@@ -2917,19 +2917,44 @@ fn validate_agent_proxy_url(raw: &str) -> Result<String, String> {
 }
 
 /// The agent proxy for MonoCode's own requests to agent services, such as
-/// reading usage limits. `None` keeps them direct.
+/// reading usage limits. With no setting, use the system fallback only when
+/// no inherited proxy environment is already in charge.
 pub(crate) fn agent_proxy(raw: Option<&str>) -> Result<Option<ureq::Proxy>, String> {
     raw.map(validate_agent_proxy_url)
         .transpose()?
+        .or_else(|| crate::system_proxy::fallback().map(|proxy| proxy.url))
         .map(|url| ureq::Proxy::new(url).map_err(|e| format!("harness: invalid proxy URL: {e}")))
         .transpose()
 }
 
 /// Points the child's proxy variables, lower- and upper-case, at a validated
 /// proxy. The parent's NO_PROXY/no_proxy entries are preserved and loopback
-/// stays direct; `None` leaves the inherited environment alone.
+/// stays direct. With no setting, an unset proxy environment falls back to macOS.
 fn apply_agent_proxy(cmd: &mut Command, proxy: Option<&str>) {
+    apply_agent_proxy_with_system(
+        cmd,
+        proxy,
+        crate::system_proxy::has_proxy_env(),
+        crate::system_proxy::fallback,
+    );
+}
+
+fn apply_agent_proxy_with_system(
+    cmd: &mut Command,
+    proxy: Option<&str>,
+    inherited_proxy: bool,
+    system_proxy: impl FnOnce() -> Option<crate::system_proxy::SystemProxy>,
+) {
     let Some(proxy) = proxy else {
+        if !inherited_proxy {
+            if let Some(system) = system_proxy() {
+                for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+                    cmd.env(name, &system.url);
+                }
+                cmd.env("NO_PROXY", &system.no_proxy);
+                cmd.env("no_proxy", &system.no_proxy);
+            }
+        }
         return;
     };
     for name in [
@@ -3202,7 +3227,9 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        apply_agent_proxy(&mut plain, None);
+        apply_agent_proxy_with_system(&mut plain, None, true, || {
+            panic!("inherited proxy must not read scutil")
+        });
         let plain_out = plain.output().expect("spawn unproxied child");
         assert_eq!(
             String::from_utf8_lossy(&plain_out.stdout).trim_end_matches('\n'),
@@ -3218,6 +3245,49 @@ mod tests {
             validate_agent_proxy_url("http://127.0.0.1:7897/").as_deref(),
             Ok("http://127.0.0.1:7897")
         );
+    }
+
+    #[test]
+    fn system_proxy_keeps_inherited_child_environment() {
+        let mut cmd = Command::new("unused");
+        cmd.env("HTTPS_PROXY", "http://inherited.example:8080");
+        cmd.env("NO_PROXY", "inherited.example");
+        apply_agent_proxy_with_system(&mut cmd, None, true, || {
+            panic!("inherited proxy must win over the system proxy")
+        });
+        let env: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(env.len(), 2);
+        assert_eq!(
+            env[std::ffi::OsStr::new("HTTPS_PROXY")],
+            Some(std::ffi::OsStr::new("http://inherited.example:8080"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("NO_PROXY")],
+            Some(std::ffi::OsStr::new("inherited.example"))
+        );
+    }
+
+    #[test]
+    fn system_proxy_fills_unset_child_proxy_and_no_proxy() {
+        let mut cmd = Command::new("unused");
+        let system = crate::system_proxy::SystemProxy {
+            url: "http://127.0.0.1:7897".into(),
+            no_proxy: "localhost,127.0.0.1,::1,.example.com,10.0.0.0/8".into(),
+        };
+        apply_agent_proxy_with_system(&mut cmd, None, false, || Some(system.clone()));
+        let env: HashMap<_, _> = cmd.get_envs().collect();
+        for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            assert_eq!(
+                env[std::ffi::OsStr::new(name)],
+                Some(std::ffi::OsStr::new(&system.url))
+            );
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(
+                env[std::ffi::OsStr::new(name)],
+                Some(std::ffi::OsStr::new(&system.no_proxy))
+            );
+        }
     }
 
     #[test]

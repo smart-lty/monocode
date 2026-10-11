@@ -3281,7 +3281,7 @@ function ProvidersPage({
       >
         <Row
           label="HTTP(S) proxy"
-          description="Leave blank to inherit MonoCode's environment. Localhost connections bypass the custom proxy."
+          description="Leave blank to inherit MonoCode's environment, or use the macOS system proxy when no proxy environment is set. Localhost connections bypass the custom proxy."
         >
           <div className="min-w-0">
             <form

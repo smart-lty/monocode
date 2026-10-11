@@ -45,6 +45,7 @@ mod search;
 mod session_store;
 mod skills;
 pub mod ssh_askpass;
+mod system_proxy;
 #[cfg(target_os = "windows")]
 mod tray;
 mod window;
@@ -286,6 +287,7 @@ pub fn run() {
             control::app_cli_path,
             default_cwd,
             home_dir,
+            system_proxy::system_proxy_url,
             notifications::notification_permission,
             notifications::request_notification_permission,
             notifications::show_notification,

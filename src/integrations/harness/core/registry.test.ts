@@ -42,6 +42,12 @@ function stub(
 }
 
 describe("harness registry", () => {
+  it("uses the existing CLI transport for references while retaining separate Operator authority", async () => {
+    const sendTurn = vi.fn(async (_input: SendTurnInput) => {});
+    registerHarness(stub("codex", { sendTurn }));
+    await sendHarnessTurn({ harness: "codex", sessionId: "reference-turn", cwd: "/project", model: "codex:test", runtimeMode: "full-access", text: "Current approved plan\nReference directory", appAccess: false, sessionReferenceAccess: true, onEvent: vi.fn() });
+    expect(sendTurn).toHaveBeenCalledWith(expect.objectContaining({ text: "Current approved plan\nReference directory", controlsAgents: true, appAccess: false, sessionReferenceAccess: true }));
+  });
   afterEach(() => {
     resetHarnessModelOverlays();
     resetHarnessIdlePark();
@@ -420,6 +426,8 @@ describe("harness registry", () => {
     bindHarnessSession("claude", "s1", "sess_1", "/repo", "work", [
       { id: "b1", role: "user", text: "go" },
       { id: "b2", role: "tasks", text: "Write tests", taskList },
+      { id: "b3", role: "tasks", text: "Historical tasks", inherited: true,
+        taskList: { ...taskList, key: "historical" } },
     ]);
     bindHarnessSession("claude", "s2", "sess_2", "/repo");
 

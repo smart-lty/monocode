@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { HARNESSES, type HarnessId, type Session } from "../../sessions/model/session";
+import type { ModelSetting } from "../../sessions/model/models";
 import { pathKey } from "../../../shared/lib/paths";
 import type { ApprovalDecision, HarnessEvent } from "../../../integrations/harness/core/types";
 import { pendingApprovalForSession } from "../../notifications/model/approvalToast";
@@ -7,11 +8,14 @@ import type { UserQuestionReply } from "../../sessions/model/userQuestion";
 import {
   validateOrchestrationSettings,
   validateProposedTasks,
+  validateTaskModelSettings,
   type OrchestrationChoice,
   type OrchestrationProposal,
 } from "./orchestrationPlan";
 import {
   normalizeOrchestrationRun,
+  isLiveRun,
+  canStopRun,
   orchestrationCheckoutCwd,
   orchestrationWorkspace,
   workspaceIdentity,
@@ -49,7 +53,10 @@ export type WorkerPreparation = {
 export type OrchestrationHost = {
   session(id: string): Session | undefined;
   sessions(): Session[];
-  choices(): { harness: HarnessId; models: { id: string; name: string }[] }[];
+  choices(): {
+    harness: HarnessId;
+    models: { id: string; name: string; settings?: ModelSetting[] }[];
+  }[];
   createWorker(
     run: OrchestrationRun,
     task: OrchestrationTask,
@@ -69,7 +76,7 @@ export type OrchestrationHost = {
     text: string,
     done: (outcome: ControlOutcome) => void,
   ): void;
-  stop(id: string): Promise<void>;
+  stop(id: string, worker?: { cwd: string }): Promise<void | { checkpointError: string }>;
   /** Redirect a worker mid-turn, without discarding what it has already done. */
   steer(id: string, text: string): Promise<void>;
   /** Answer on a worker's behalf; the lead, not the user, decides. */
@@ -84,7 +91,7 @@ type Storage = {
   save(run: OrchestrationRun): Promise<void>;
   load(id: string): Promise<OrchestrationRun | null>;
   enable(id: string, cwd: string): Promise<string>;
-  disable(id: string): Promise<void>;
+  disable(id: string, replyRequestId?: string): Promise<void>;
   scopes(cwd: string, files: string[]): Promise<string[]>;
   resolvePath(path: string): Promise<string>;
 };
@@ -104,7 +111,8 @@ const storage: Storage = {
     return normalizeOrchestrationRun(run);
   },
   enable: (sessionId, cwd) => invoke("control_enable", { sessionId, cwd }),
-  disable: (sessionId) => invoke("control_disable", { sessionId }),
+  disable: (sessionId, replyRequestId) =>
+    invoke("control_disable", { sessionId, replyRequestId }),
   scopes: (cwd, files) => invoke("control_scopes", { cwd, files }),
   resolvePath: (path) => invoke("control_write_path", { path }),
 };
@@ -199,7 +207,7 @@ function strings(value: unknown, label: string, max = 64): string[] {
  */
 const FIELDS = new Map<string, string[]>([
   ["list", []],
-  ["delegate", ["title", "harness", "model", "prompt", "files", "dependsOn"]],
+  ["delegate", ["title", "harness", "model", "modelSettings", "prompt", "files", "dependsOn"]],
   ["get", ["taskId"]],
   ["message", ["taskId", "text"]],
   ["retry", ["taskId", "text", "files"]],
@@ -274,6 +282,7 @@ export class Orchestrator {
   private runs: OrchestrationRun[] = [];
   private listeners = new Set<() => void>();
   private loaded = new Set<string>();
+  private hydrating = new Map<string, Promise<void>>();
   private deleted = new Set<string>();
   private persisted = new Map<string, OrchestrationRun>();
   private saves = Promise.resolve();
@@ -325,6 +334,11 @@ export class Orchestrator {
         (session) =>
           session.id !== leadId &&
           session.busy &&
+          this.runs.some(
+            (run) =>
+              run.leadId === session.id &&
+              (run.status === "active" || run.status === "paused"),
+          ) &&
           sameCheckout(session.worktreeCwd ?? session.cwd, cwd),
       );
   }
@@ -490,20 +504,41 @@ export class Orchestrator {
       return false;
     }
   }
-  async hydrate(id: string) {
-    if (this.loaded.has(id) || this.run(id)) return;
-    this.loaded.add(id);
+  hydrate(id: string): Promise<void> {
+    const pending = this.hydrating.get(id);
+    if (pending) return pending;
+    if (this.loaded.has(id) || this.run(id)) return Promise.resolve();
+    const loading = this.restoreRun(id).then(() => {
+      this.loaded.add(id);
+    }).finally(() => {
+      this.hydrating.delete(id);
+    });
+    this.hydrating.set(id, loading);
+    return loading;
+  }
+  private async restoreRun(id: string) {
     try {
       const loaded = await this.store.load(id);
       if (!loaded || this.run(id) || this.deleted.has(id)) return;
       const run = normalizeOrchestrationRun(loaded);
-      if (run.status === "active" || run.tasks.some(activeTask)) {
-        await Promise.all(
-          [
-            id,
-            ...run.tasks.filter(activeTask).map((task) => task.sessionId),
-          ].map((sessionId) => this.host?.stop(sessionId)),
-        );
+      try {
+        if (run.status === "active" || run.stopPending || run.tasks.some(activeTask)) {
+          await Promise.all([
+            ...(isLiveRun(run) || run.stopPending
+              ? [this.host?.stop(id)]
+              : []),
+            ...run.tasks.filter(activeTask).map((task) =>
+              this.host?.stop(task.sessionId,
+                task.workspacePolicy !== "shared" && task.workspace
+                  ? { cwd: task.workspace.checkoutCwd }
+                  : undefined,
+              ),
+            ),
+          ]);
+        }
+      } finally {
+        // Reloads may retain a connection even when the lead was idle. Every
+        // saved state needs fresh authorization before another provider starts.
         await this.store.disable(id);
       }
       const interrupted = new Set(
@@ -515,21 +550,25 @@ export class Orchestrator {
       await this.commit({
         ...run,
         status: run.status === "active" ? "paused" : run.status,
+        stopPending: false,
         tasks: run.tasks.map((task) =>
           activeTask(task)
             ? {
                 ...task,
-                status: "interrupted",
+                status: run.status === "stopped" || run.status === "finished"
+                  ? "cancelled"
+                  : "interrupted",
                 activeDispatchId: undefined,
                 ...(task.activeDispatchId
                   ? { lastDispatchId: task.activeDispatchId }
                   : {}),
                 accepted: false,
-                error:
-                  "Interrupted while MonoCode was not running. Resume will continue from the retained worker checkout.",
-                recoveryPrompt: recoveryTurn(
-                  "MonoCode stopped while the worker was running",
-                ),
+                error: run.status === "stopped" || run.status === "finished"
+                  ? "Stopped after reloading a terminal run. The worker checkout was retained."
+                  : "Interrupted while MonoCode was not running. Resume will continue from the retained worker checkout.",
+                recoveryPrompt: run.status === "stopped" || run.status === "finished"
+                  ? undefined
+                  : recoveryTurn("MonoCode stopped while the worker was running"),
                 delivered: true,
               }
             : { ...task, delivered: task.accepted || task.status === "queued" },
@@ -538,7 +577,9 @@ export class Orchestrator {
           interrupted.has(dispatch.id)
             ? {
                 ...dispatch,
-                state: "interrupted",
+                state: run.status === "stopped" || run.status === "finished"
+                  ? "cancelled"
+                  : "interrupted",
                 stage: "settled",
                 updatedAt: Date.now(),
                 error: "Interrupted while MonoCode was not running.",
@@ -590,6 +631,11 @@ export class Orchestrator {
       proposal.tasks,
       settings,
       proposal.checkoutCwd ?? proposal.cwd,
+      (harness, model) =>
+        this.host
+          ?.choices()
+          .find((choice) => choice.harness === harness)
+          ?.models.find((choice) => choice.id === model)?.settings,
     );
     const lead = this.host?.session(leadId);
     if (
@@ -678,6 +724,7 @@ export class Orchestrator {
       tasks: OrchestrationTask[];
     },
   ) {
+    await this.hydrate(leadId);
     const lead = this.host?.session(leadId);
     if (!lead) throw new Error("The orchestration lead is unavailable");
     if (lead.busy)
@@ -700,6 +747,14 @@ export class Orchestrator {
     )
       throw new Error("Choose installed worker harnesses");
     const previous = this.run(leadId);
+    if (previous?.stopPending)
+      throw new Error("Retry Stop orchestration before starting another run.");
+    if (this.runs.some((run) =>
+      run.leadId !== leadId &&
+      canStopRun(run) &&
+      sameCheckout(orchestrationCheckoutCwd(run), workspace.checkoutCwd)
+    ))
+      throw new Error("This checkout already has an orchestrator in another session");
     if (
       previous?.status === "active" ||
       (approved && previous?.status === "paused")
@@ -797,24 +852,11 @@ export class Orchestrator {
     const session = this.host?.session(id);
     if (!session) return null;
     const own = this.forSession(id);
-    if (
-      own &&
-      own.leadId !== id &&
-      (own.status === "active" || own.tasks.some(activeTask))
-    )
+    if (own && own.leadId !== id && canStopRun(own))
       return "This worker is managed by the orchestrator. Send instructions through its lead or stop the run first.";
-    const other = this.runs.find(
-      (run) =>
-        (run.status === "active" || run.tasks.some(activeTask)) &&
-        run.leadId !== id &&
-        sameCheckout(
-          orchestrationCheckoutCwd(run),
-          session.worktreeCwd ?? session.cwd,
-        ),
-    );
-    if (other)
-      return "This checkout has an active orchestrator. Stop that run before starting independent work.";
-    if (own?.status === "paused")
+    if (own?.stopPending)
+      return "Some processes could not be stopped. Retry Stop orchestration before continuing this conversation.";
+    if (own?.leadId === id && own.status === "paused")
       return "Resume or stop orchestration before sending the lead another turn.";
     if (
       own?.status === "active" &&
@@ -1050,6 +1092,11 @@ export class Orchestrator {
             `Choose a model ID returned by list for ${harness}: ${listed(permittedModels.map((item) => item.id)) || "none available"}.`,
           );
         const title = text(input.title, "title", 160);
+        const modelSettings = validateTaskModelSettings(
+          input.modelSettings,
+          model,
+          permittedModels.find((item) => item.id === model)?.settings,
+        );
         const prompt = text(input.prompt, "prompt");
         const files = strings(input.files, "files");
         if (!files.length)
@@ -1081,6 +1128,7 @@ export class Orchestrator {
           dependsOn,
           harness,
           model,
+          ...(modelSettings === undefined ? {} : { modelSettings }),
           status: "queued",
           accepted: false,
           result: "",
@@ -1407,7 +1455,7 @@ export class Orchestrator {
             ...(cleanupPending.length ? { cleanupPending } : {}),
           },
         );
-        await this.store.disable(run.leadId);
+        await this.store.disable(run.leadId, requestId);
         return result;
       }
       default:
@@ -1842,33 +1890,80 @@ export class Orchestrator {
     await this.commit({ ...run, status: "stopped" }).catch((error: unknown) => {
       saveError = error;
     });
-    await Promise.all(
-      [
-        leadId,
-        ...run.tasks.filter(activeTask).map((task) => task.sessionId),
-      ].map((id) => this.host?.stop(id)),
+    const stoppingIds = [
+      leadId,
+      ...run.tasks.filter(activeTask).map((task) => task.sessionId),
+    ];
+    const stopping = await Promise.allSettled(
+      stoppingIds.map((id) => this.host?.stop(id)),
     );
+    const failures = new Map(
+      stopping.flatMap((result, index) =>
+        result.status === "rejected"
+          ? [[stoppingIds[index], messageOf(result.reason)]]
+          : [],
+      ),
+    );
+    const checkpointErrors = new Map(
+      stopping.flatMap((result, index) =>
+        result.status === "fulfilled" && result.value?.checkpointError
+          ? [[stoppingIds[index], result.value.checkpointError]]
+          : [],
+      ),
+    );
+    // Revocation failure must not prevent stopped workers from settling either.
+    await this.store.disable(leadId).catch((error: unknown) => {
+      failures.set(
+        leadId,
+        `Could not revoke the control connection: ${messageOf(error)}`,
+      );
+    });
+
     const latest = this.run(leadId)!;
     const stopped: OrchestrationRun = {
       ...latest,
       status: "stopped",
+      stopPending: failures.size > 0,
+      error: failures.size
+        ? `Some processes could not be stopped: ${[...failures.values()].join("; ")}. Retry Stop orchestration.`
+        : checkpointErrors.size
+          ? "Run stopped. Some worker checkpoints could not be saved; files were retained for manual review."
+          : undefined,
+      lastPauseReason: undefined,
       tasks: latest.tasks.map((task) =>
-        activeTask(task) || task.status === "queued"
+        failures.has(task.sessionId)
           ? {
               ...task,
-              status: "cancelled",
-              accepted: false,
-              delivered: true,
-              activeDispatchId: undefined,
-              ...(task.activeDispatchId
-                ? { lastDispatchId: task.activeDispatchId }
-                : {}),
+              status: "cancelling",
+              error: `Could not stop this worker: ${failures.get(task.sessionId)}. Retry Stop orchestration.`,
             }
-          : task,
+          : activeTask(task) ||
+              task.status === "queued" ||
+              run.tasks.some(
+                (original) => original.id === task.id && activeTask(original),
+              )
+            ? {
+                ...task,
+                status: "cancelled",
+                error: checkpointErrors.get(task.sessionId)
+                  ? `Worker stopped, but its checkpoint could not be saved: ${checkpointErrors.get(task.sessionId)}. Files were retained for manual review.`
+                  : "Stopped. Worker files were retained; this run cannot resume.",
+                recoveryPrompt: undefined,
+                accepted: false,
+                delivered: true,
+                activeDispatchId: undefined,
+                ...(task.activeDispatchId
+                  ? { lastDispatchId: task.activeDispatchId }
+                  : {}),
+              }
+            : task,
       ),
       dispatches: (latest.dispatches ?? []).map((dispatch) =>
-        latest.tasks.some(
-          (task) => task.activeDispatchId === dispatch.id && activeTask(task),
+        run.tasks.some(
+          (task) =>
+            task.activeDispatchId === dispatch.id &&
+            activeTask(task) &&
+            !failures.has(task.sessionId),
         )
           ? {
               ...dispatch,
@@ -1879,14 +1974,20 @@ export class Orchestrator {
           : dispatch,
       ),
     };
-    for (const task of latest.tasks) {
-      if (task.activeDispatchId) this.writeChecks.delete(task.activeDispatchId);
+    for (const task of run.tasks) {
+      if (task.activeDispatchId && !failures.has(task.sessionId))
+        this.writeChecks.delete(task.activeDispatchId);
     }
     await this.commit(stopped).catch((error: unknown) => {
       saveError = error;
     });
     if (!saveError) {
-      for (const task of stopped.tasks.filter((entry) => !entry.accepted))
+      for (const task of stopped.tasks.filter(
+        (entry) =>
+          !entry.accepted &&
+          !activeTask(entry) &&
+          !checkpointErrors.has(entry.sessionId),
+      ))
         await this.cleanupUnchangedWorker(leadId, task.id);
     }
     const afterCleanup = this.run(leadId) ?? stopped;
@@ -1894,24 +1995,19 @@ export class Orchestrator {
       entry.leadId === leadId
         ? {
             ...afterCleanup,
+            status: "stopped",
+            stopPending: failures.size > 0,
             error: saveError
               ? `Run stopped; could not save history: ${messageOf(saveError)}`
-              : afterCleanup.error,
+              : stopped.error,
           }
         : entry,
     );
     this.emit();
-    await this.store.disable(leadId);
   }
   stopForSession(id: string): Promise<void> | null {
     const run = this.forSession(id);
-    if (
-      !run ||
-      (run.status !== "active" &&
-        run.status !== "paused" &&
-        !run.tasks.some(activeTask))
-    )
-      return null;
+    if (!run || !canStopRun(run)) return null;
     if (run.leadId === id) return this.stopRun(id);
     const task = run.tasks.find((entry) => entry.sessionId === id)!;
     return this.cancelTask(run.leadId, task.id);

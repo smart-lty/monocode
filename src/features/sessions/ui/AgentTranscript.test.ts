@@ -25,6 +25,22 @@ function render(
 }
 
 describe("AgentTranscript collapsed work", () => {
+  it.each(["cancelled", "error"] as const)("shows a persisted %s turn without a success duration", (turnOutcome) => {
+    const markup = render([
+      { id: "user", role: "user", text: "Wait", startedAt: 1_000, durationMs: 28_000, turnOutcome,
+        turnModel: { harness: "codex", id: "codex:gpt-6.1-sol", name: "GPT-6.1-Sol" } },
+      { id: "partial", role: "assistant", text: "PARTIAL-KEEP" },
+      { id: "tool", role: "tool", text: "sleep 60", tool: { kind: "execute", status: turnOutcome === "error" ? "failed" : "cancelled" } },
+    ]);
+    expect(markup).toContain(`aria-label="${turnOutcome === "cancelled" ? "Stopped" : "Failed"}"`);
+    expect(markup).toContain("PARTIAL-KEEP");
+    expect(markup).not.toContain("worked for 28s");
+    expect(markup).not.toContain("Worked for 28s");
+    const empty = render([{ id: "user", role: "user", text: "Wait", startedAt: 1_000,
+      durationMs: 28_000, turnOutcome }]);
+    expect(empty).not.toContain("lucide-check");
+  });
+
   it("keeps the completed time beside actions when a turn has no BTW control", () => {
     const markup = render([
       {

@@ -11,6 +11,8 @@ export type OrchestrationSummary = {
     harness: HarnessId;
     model: string;
     status: TaskStatus;
+    accepted?: boolean;
+    workspacePolicy?: "shared" | "isolated-child" | "isolated-top-level";
     needsInput?: boolean;
   }[];
 };
@@ -23,12 +25,14 @@ export function summarizeOrchestration(
   return {
     status: run.status,
     live: true,
-    tasks: run.tasks.map(({ sessionId, title, harness, model, status }) => ({
+    tasks: run.tasks.map(({ sessionId, title, harness, model, status, accepted, workspacePolicy }) => ({
       sessionId,
       title,
       harness,
       model,
       status,
+      accepted,
+      workspacePolicy,
       needsInput:
         !!byId.get(sessionId) && sessionNeedsInput(byId.get(sessionId)!),
     })),
@@ -40,6 +44,14 @@ export function orchestrationTaskLabel(
   summary: OrchestrationSummary,
 ): string {
   if (task.needsInput) return "Needs input";
+  if (task.status === "completed") {
+    if (task.accepted === undefined && !summary.live) return "Done";
+    const shared = task.workspacePolicy === "shared";
+    if (task.accepted) return shared ? "Reviewed" : "Integrated";
+    if (summary.status === "stopped" || summary.status === "finished")
+      return shared ? "Not reviewed" : "Not integrated";
+    return "Awaiting review";
+  }
   if (
     !summary.live &&
     ["running", "cancelling", "queued"].includes(task.status)

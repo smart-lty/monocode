@@ -1,3 +1,4 @@
+import { enqueueTextPrompt } from "../../core/textQueue";
 import { modelsFor } from "../../../../features/sessions/model/models";
 import type { TurnIntent } from "../../../../features/sessions/model/session";
 import {
@@ -78,13 +79,11 @@ export async function runOpenCodeTextPrompt(input: {
   timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: HarnessEvent) => void;
+  onQueueState?: (state: "queued" | "running") => void;
 }): Promise<string> {
-  const run = turns.catch(() => undefined).then(() => promptOnLive(input));
-  turns = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+  const queued = enqueueTextPrompt(turns, input, () => promptOnLive(input));
+  turns = queued.tail;
+  return queued.result;
 }
 
 async function promptOnLive(input: {

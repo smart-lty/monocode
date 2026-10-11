@@ -1,4 +1,8 @@
+import { isLiveRun } from "../features/orchestration/model/orchestrationState";
 import { sessionConversationPage } from "../features/agent-app/model/sessionConversation";
+import { SessionBlocksVersionError } from "../features/agent-app/model/sessionBlocks";
+import { prepareSessionReferenceTurn, referencedSessionIds, sanitizeSessionReferences, sentSessionReferences, type SessionReference } from "../features/sessions/model/sessionReferences";
+import { referencesRequireNewTurn } from "../features/sessions/model/sessionReferenceDelivery";
 import { readMonoConversation } from "../features/monos/model/monoConversation";
 import {
   resumeMonoUsageLimit,
@@ -20,11 +24,14 @@ import { useIdleSessionDetach } from "./hooks/useIdleSessionDetach";
 import { HarnessEventQueue } from "./model/harnessFlush";
 import {
   handleAgentApp,
+  agentAppSourceAllowed,
   canAccessAgentAppProject,
   type AppSessionListing,
   type AppSessionPlacement,
 } from "../features/agent-app/model/agentApp";
 import { submitWithSettlement } from "./model/managedSubmission";
+import { finishStoppedWorkerCheckpoint } from "./model/workerCheckpoint";
+import { useOrchestrationRestore } from "./hooks/useOrchestrationRestore";
 import {
   submitAfterProjectSync,
   type SubmissionAcceptance,
@@ -325,10 +332,19 @@ import {
   applyBtwHarnessEvent,
   btwTurnHarness,
   buildBtwPrompt,
+  buildBtwResumePrompt,
+  cancelBtwThread,
+  queueBtwThread,
   replaceBtwThread,
   sealBtwResponseBlocks,
   supportsBtwHarness,
 } from "../features/sessions/model/btw";
+import { completedSessionBoundary,
+  SESSION_FORK_EVENT, type SessionForkRequest } from "../features/sessions/model/sessionFork";
+import { runSessionFork } from "../features/sessions/model/sessionForkOperation";
+import { forkHarnessSession } from "../integrations/harness/core/registry";
+import { btwContextReader } from "../features/agent-app/model/btwContext";
+import { provideSessionTitles } from "../features/sessions/ui/sessionTitleLookup";
 
 import { isEditTool } from "../integrations/harness/core/preview";
 import {
@@ -337,6 +353,7 @@ import {
 } from "../features/sessions/model/editLastTurn";
 import {
   beginSessionTurn,
+  ensureSessionCheckpoint,
   finishSessionTurn,
   applySessionCheckpoint,
   captureSessionCheckpoint,
@@ -465,6 +482,7 @@ import {
   canDispatchQueuedHead,
   canSteerQueuedHead,
   dequeueQueuedMessage,
+  enqueueQueuedMessage,
   queuedMessageForSubmit,
 } from "../features/sessions/model/messageQueue";
 import { deliverQueuedFollowUp } from "../features/sessions/model/queuedFollowUp";
@@ -483,6 +501,8 @@ import {
   discardDraftSessionRecord,
   deleteSession,
   getSession,
+  getSessionReferenceSnapshot,
+  exportSessionReference,
   listLinkedSessions,
   listSessionsByProject,
   persistFingerprint,
@@ -6583,6 +6603,7 @@ function Workspace({
       text: string,
       attachments: Attachment[] = [],
       appRequestId?: string,
+      sessionReferences?: SessionReference[],
     ) => {
       const current = sessionsRef.current.find(
         (session) => session.id === sessionId,
@@ -6595,7 +6616,7 @@ function Workspace({
         sessionDraftBlock(current) ||
         current.inboxAsk ||
         current.worktreeRemoved ||
-        (!text.trim() && attachments.length === 0)
+        (!text.trim() && attachments.length === 0 && !sessionReferences?.length)
       ) {
         return false;
       }
@@ -6621,6 +6642,7 @@ function Workspace({
                     text,
                     ...(attachments.length > 0 ? { attachments } : {}),
                     draft: true,
+                    ...(sessionReferences?.length ? { sessionReferences: sanitizeSessionReferences(sessionReferences) } : {}),
                     ...(appRequestId ? { appRequestId } : {}),
                   },
                 ],
@@ -6789,7 +6811,9 @@ function Workspace({
               block.id === options.planBlockId && block.role === "plan",
           )
         : undefined;
-      if (intent === "build" && !approvedPlan?.text.trim()) return false;
+      if (intent === "build" && (!approvedPlan?.text.trim() || approvedPlan.inherited)) return false;
+      // An unbound fork record is kept for manual recovery; it never sends.
+      if (current.blocks.some((block) => block.forkOrigin?.recovery)) return false;
       if (options?.queuedMessageId) {
         const mode =
           options.followUpBehavior === "steer" ? "steer" : "dispatch";
@@ -6803,11 +6827,19 @@ function Workspace({
         options && "handoffCard" in options
           ? options.handoffCard
           : current.handoffCard;
+      const sessionReferences = sanitizeSessionReferences(
+        options?.sessionReferences ?? draftBlock?.sessionReferences ??
+        current.queuedMessages?.find((message) => message.id === options?.queuedMessageId)?.sessionReferences,
+      ).filter((ref) => ref.sessionId !== sessionId);
+      const editedReferenceAuthorizationPending = !!editedResend && (
+        referencedSessionIds(storedCurrent.blocks).length > 0 ||
+        referencedSessionIds(current.blocks).length > 0 || sessionReferences.length > 0
+      );
       if (
         !text.trim() &&
         attachments.length === 0 &&
         !noteCard &&
-        !handoffCard
+        !handoffCard && !sessionReferences.length
       ) {
         return false;
       }
@@ -6903,6 +6935,7 @@ function Workspace({
                   attachments,
                   noteCard,
                   handoffCard,
+                  ...(sessionReferences.length ? { sessionReferences } : {}),
                   intent,
                 },
                 rawCommand ? undefined : userTurnCards(noteCard),
@@ -6991,6 +7024,14 @@ function Workspace({
       }
 
       if (current.busy && !pendingSwitch) {
+        const referenceNeedsNewTurn = referencesRequireNewTurn(current.blocks, sessionReferences, operatorAccess);
+        if (referenceNeedsNewTurn && options?.queuedMessageId) {
+          enqueueHarnessEvent(sessionId, {
+            type: "status", text: "引用会在下一 turn 发送；这条排队消息暂时保留。请等待当前 turn 结束，或先停止它。",
+          });
+          flushHarnessEvents();
+          return false;
+        }
         if (
           operatorCommand.matched &&
           options?.queuedMessageId &&
@@ -7009,7 +7050,7 @@ function Workspace({
           current.worktreePreparing ||
           intent === "plan" ||
           intent === "orchestrate" ||
-          operatorCommand.matched
+          operatorCommand.matched || referenceNeedsNewTurn
             ? "queue"
             : // The agent has yielded and only background work is left, which
               // may never end (a dev server). Queuing would park the message
@@ -7028,28 +7069,22 @@ function Workspace({
             prev.map((s) =>
               s.id === sessionId
                 ? {
-                    ...s,
+                    ...enqueueQueuedMessage(s, {
+                      id: crypto.randomUUID(), text, attachments, noteCard, handoffCard,
+                      ...(sessionReferences.length ? { sessionReferences } : {}), intent,
+                    }),
                     inboxCard: rawCommand ? s.inboxCard : undefined,
                     noteCard: rawCommand ? s.noteCard : undefined,
                     handoffCard: rawCommand ? s.handoffCard : undefined,
-                    queuedMessages: [
-                      ...(s.queuedMessages ?? []),
-                      {
-                        id: crypto.randomUUID(),
-                        text,
-                        attachments,
-                        noteCard,
-                        handoffCard,
-                        intent,
-                      },
-                    ],
-                    queueStatus:
-                      s.queueStatus === "paused" ? "paused" : "active",
                   }
                 : s,
             ),
           );
           dismissNoticesForContinuedSession(sessionId);
+          if (referenceNeedsNewTurn) {
+            enqueueHarnessEvent(sessionId, { type: "status", text: "首次引用已排队，将在当前 turn 结束后的下一 turn 发送并开放只读补读。" });
+            flushHarnessEvents();
+          }
           return true;
         }
         if (!steerable) {
@@ -7064,7 +7099,7 @@ function Workspace({
         }
         dismissNoticesForContinuedSession(sessionId);
         const visible = displayAttachments(attachments);
-        const cards = userTurnCards(noteCard);
+        const cards = { ...userTurnCards(noteCard), ...(sessionReferences.length ? { sessionReferences } : {}) };
         const nextSessions = sessionsRef.current.map((s) => {
           if (s.id !== sessionId) return s;
           let next: Session = {
@@ -7080,6 +7115,7 @@ function Workspace({
         });
         sessionsRef.current = nextSessions;
         setSessions(nextSessions);
+        const steerGen = turnGen.current.get(sessionId);
         void (async () => {
           try {
             const prepared = await prepareAttachments(attachments);
@@ -7088,6 +7124,17 @@ function Workspace({
               sessionId,
               cwd: initialWorkCwd,
             });
+            const referenceTurn = await prepareSessionReferenceTurn({ sessionId, blocks: current.blocks, added: sessionReferences, prompt, nativeCommand: rawCommand, contextWindowTokens: current.context?.window ?? resolveModel(current.harness, current.model).contextWindow }, {
+              cliPath: () => invoke<string>("app_cli_path"), snapshot: getSessionReferenceSnapshot,
+            });
+            if (turnGen.current.get(sessionId) !== steerGen || !sessionsRef.current.find((session) => session.id === sessionId)?.busy) return;
+            const sent = sessionsRef.current.find((session) => session.id === sessionId);
+            if (referenceTurn.references.length && sent) {
+              if (!await upsertSession(sent)) throw new Error("Sent references could not be saved");
+              if (turnGen.current.get(sessionId) !== steerGen) return;
+              await invoke("control_refresh_references", { sessionId });
+            }
+            if (turnGen.current.get(sessionId) !== steerGen || !sessionsRef.current.find((session) => session.id === sessionId)?.busy) return;
             await steerHarnessTurn({
               harness: current.harness,
               sessionId,
@@ -7096,7 +7143,7 @@ function Workspace({
               modelSettings: current.modelSettings,
               text: inboxAskPrompt(
                 rawCommand ? undefined : current.inboxAsk,
-                prompt,
+                referenceTurn.context ? `${prompt}\n\n${referenceTurn.context}` : prompt,
               ),
               attachments: prepared,
             });
@@ -7241,6 +7288,7 @@ function Workspace({
             ? SECOND_OPINION_TITLE
             : submittedText;
       const cards = {
+        ...(sessionReferences.length ? { sessionReferences } : {}),
         ...(rawCommand ? undefined : userTurnCards(noteCard, card)),
         ...(ciContext ? { ciContext } : {}),
         ...(operatorCommand.matched ? { monocode: true } : {}),
@@ -7657,7 +7705,8 @@ function Workspace({
             revealHandoff(wrap.text);
           }
           nudgeOpenEditors(event, workCwd);
-          if (!orchestrator.forSession(sessionId))
+          const run = orchestrator.forSession(sessionId);
+          if (!run || ["stopped", "finished"].includes(run.status))
             trackSessionEdits(sessionId, workCwd, event);
           const routed = routePlanEvent(event);
           if (routed) enqueueHarnessEvent(sessionId, routed);
@@ -7672,10 +7721,19 @@ function Workspace({
         };
         const acceptEditedResend = () => {
           if (!editedResend || editedResend.isAccepted()) return;
+          if (turnGen.current.get(sessionId) !== gen) throw new Error("Edited reference turn is no longer current");
           flushSync(commitSubmittedTurn);
           editedResend.markAccepted();
           for (const event of pendingEditedEvents) applyTurnEvent(event);
           pendingEditedEvents.length = 0;
+          if (editedReferenceAuthorizationPending) {
+            const sent = sessionsRef.current.find((session) => session.id === sessionId);
+            if (!sent) throw new Error("Accepted reference session is unavailable");
+            // The registry awaits this save, then opens only this turn's DB-derived scope.
+            return upsertSession(sent).then((saved) => {
+              if (!saved) throw new Error("Accepted references could not be saved");
+            });
+          }
         };
         const recoverEditedResend = () => {
           if (!editedResend || editedResend.isAccepted()) return;
@@ -7695,20 +7753,36 @@ function Workspace({
           });
         };
 
-        const checkpointTurnId =
-          !current.inboxAsk && !orchestrator.forSession(sessionId)
-            ? await beginSessionTurn(sessionId, workCwd)
-            : undefined;
-        if (turnGen.current.get(sessionId) !== gen) {
-          if (checkpointTurnId) {
-            await finishSessionTurn(sessionId, workCwd, {
-              turnId: checkpointTurnId,
-            });
-          }
-          return;
-        }
+        let checkpointTurnId: string | undefined;
+        let checkpointWorker = false;
         let buildSucceeded = false;
         try {
+          await orchestrator.hydrate(current.orchestrationLeadId ?? sessionId);
+          if (turnGen.current.get(sessionId) !== gen) return;
+          const managedRun = orchestrator.forSession(sessionId);
+          checkpointWorker =
+            !!current.orchestrationLeadId &&
+            !!managedRun &&
+            isLiveRun(managedRun) &&
+            !!managedRun.tasks.some(
+              (task) => task.sessionId === sessionId && task.workspacePolicy !== "shared",
+            );
+          const restoredError = orchestrator.submissionError(
+            sessionId,
+            options?.managed,
+          );
+          if (restoredError) throw new Error(restoredError);
+          if (
+            !current.inboxAsk &&
+            (!managedRun || checkpointWorker ||
+              ["stopped", "finished"].includes(managedRun.status))
+          )
+            checkpointTurnId = await beginSessionTurn(sessionId, workCwd, {
+              required: checkpointWorker,
+              retireWorker:
+                !!current.orchestrationLeadId && !!managedRun && !isLiveRun(managedRun),
+            });
+          if (turnGen.current.get(sessionId) !== gen) return;
           const prepared = await prepareAttachments(attachments);
           const prompt =
             intent === "build" && approvedPlan
@@ -7809,6 +7883,8 @@ function Workspace({
                 operatorAccess ||
                 orchestrator.run(sessionId)?.status === "active",
               appAccess: operatorAccess,
+              sessionReferenceAccess: referencedSessionIds(current.blocks).length > 0 || sessionReferences.length > 0,
+              sessionReferenceAuthorizationPending: editedReferenceAuthorizationPending,
               text,
               attachments: turnAttachments,
               ...(editedResend ? { onAccepted: acceptEditedResend } : {}),
@@ -7828,6 +7904,16 @@ function Workspace({
                 : turnPrompt,
             ),
           );
+          const referenceTurn = await prepareSessionReferenceTurn({
+            sessionId, blocks: current.blocks, added: sessionReferences, prompt: sendText,
+            nativeCommand: rawCommand, contextWindowTokens: current.context?.window ?? resolveModel(current.harness, current.model).contextWindow,
+          }, { cliPath: () => invoke<string>("app_cli_path"), snapshot: getSessionReferenceSnapshot });
+          if (referenceTurn.references.length && !editedResend) {
+            const sent = sessionsRef.current.find((session) => session.id === sessionId);
+            if (sent && !await upsertSession(sent)) throw new Error("Sent references could not be saved");
+          }
+          if (turnGen.current.get(sessionId) !== gen) return;
+          if (referenceTurn.context) sendText += `\n\n${referenceTurn.context}`;
           if (monoRotation) {
             if (current.harness === "codex" && current.providerSessionId) {
               await migrateMonoCodexSession({
@@ -7897,7 +7983,7 @@ function Workspace({
           if (operatorCommand.matched || handAgent) {
             const cli = `${shellPath(await invoke<string>("app_cli_path"))} app`;
             appContext.push(
-              `<monocode_app>\n${handAgent ? "App access is always enabled in this thread." : "The user's Operator command enables app access in this thread, including later turns without the command."} You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read, continue, stop, archive or delete other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run \`${cli} --help\` when you need the exact commands and JSON fields. When reading another session, start with its latest two or three user/assistant exchanges. Request older exchanges with nextBefore or a larger excerpt only if needed. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>`,
+              `<monocode_app>\n${handAgent ? "App access is always enabled in this thread." : "The user's Operator command enables app access in this thread, including later turns without the command."} You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read, continue, stop, archive or delete other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run \`${cli} --help\` when you need the exact commands and JSON fields. For regular saved sessions, explicitly use sessions.read with view:"messages" or view:"blocks" for lossless reads. Continue older pages with nextBefore/readVersion and long blocks with blockId/nextOffset plus the same readVersion; reread if the version changes. sessions.export writes fixed files and returns a small manifest. Read selectively. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>`,
             );
           }
           // A Mono reads who it is ahead of the message, so it never takes it
@@ -7914,7 +8000,7 @@ function Workspace({
               handedFiles ?? agentFiles,
             );
           }
-          acceptEditedResend();
+          await acceptEditedResend();
           if (proposalDraft && !providerFailureSeen) {
             completedProposal = await completeOrRepairOrchestrationProposal(
               proposalDraft,
@@ -7974,9 +8060,19 @@ function Workspace({
             );
           }
           if (checkpointTurnId) {
-            await finishSessionTurn(sessionId, workCwd, {
-              turnId: checkpointTurnId,
-            });
+            try {
+              await finishSessionTurn(sessionId, workCwd, {
+                turnId: checkpointTurnId,
+                required: checkpointWorker,
+              });
+            } catch (error) {
+              providerFailureSeen = true;
+              controlOutcome.error = `Could not save worker changes: ${String(error)}`;
+              enqueueHarnessEvent(sessionId, {
+                type: "session.error",
+                message: controlOutcome.error,
+              });
+            }
           }
           if (turnGen.current.get(sessionId) !== gen) return;
           flushHarnessEvents();
@@ -8621,6 +8717,8 @@ function Workspace({
               if (
                 block.id !== blockId ||
                 block.role !== "plan" ||
+                // A fork's inherited plan is history; editing would rewrite it.
+                block.inherited ||
                 block.plan?.status === "streaming" ||
                 block.plan?.status === "building" ||
                 block.plan?.status === "built"
@@ -8660,6 +8758,7 @@ function Workspace({
         !session ||
         session.busy ||
         block?.role !== "plan" ||
+        block.inherited ||
         !!block.orchestration ||
         !block.text.trim() ||
         block.plan?.status === "streaming" ||
@@ -8755,6 +8854,7 @@ function Workspace({
                 followUpBehavior: steering ? "steer" : undefined,
                 noteCard: head.noteCard,
                 handoffCard: head.handoffCard,
+                sessionReferences: head.sessionReferences,
                 intent: head.intent,
                 ...(head.monoSessionCompletion
                   ? {
@@ -8911,6 +9011,7 @@ function Workspace({
         queuedMessageId: message.id,
         noteCard: message.noteCard,
         handoffCard: message.handoffCard,
+        sessionReferences: message.sessionReferences,
         intent: message.intent,
       });
     },
@@ -9146,6 +9247,62 @@ function Workspace({
     [appendTab],
   );
 
+  // A fork's origin card names its source by title, wherever it is open.
+  useEffect(
+    () =>
+      provideSessionTitles((id) => {
+        const session = sessionsRef.current.find((entry) => entry.id === id);
+        return session ? sessionDisplayTitle(session.title, session.harness) : undefined;
+      }),
+    [],
+  );
+  const forkRequestsRef = useRef(new Map<string, { key: string; result: Promise<string> }>());
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const request = (event as CustomEvent<SessionForkRequest>).detail;
+      if (!request?.requestId || !request.resolve || !request.reject) return;
+      const key = JSON.stringify([request.sourceSessionId, request.sourceEndBlockId, request.strategy ?? "native"]);
+      const previous = forkRequestsRef.current.get(request.requestId);
+      if (previous) {
+        if (previous.key !== key) request.reject(new Error("Fork request ID was reused for a different boundary."));
+        else void previous.result.then(request.resolve, request.reject);
+        return;
+      }
+      const result = runSessionFork(request, {
+        source: () => {
+          const source = sessionsRef.current.find((session) => session.id === request.sourceSessionId);
+          if (source && (source.worktreeRemoved || isMonoSession(source.id) || remoteProjectFor(source.cwd) ||
+            !agentAppSourceAllowed(source, orchestrator.run(source.id))))
+            throw new Error("该来源不支持普通会话 Fork。");
+          return source;
+        },
+        available: async (file) => {
+          if (file.data) return true;
+          if (!file.path) return false;
+          const paths = await invoke<{ path: string }[]>("inspect_paths", { paths: [file.path] }).catch(() => []);
+          return paths.some((path) => path.path === file.path);
+        },
+        fork: forkHarnessSession,
+        save: async (child) => {
+          if (!await upsertSession(child)) throw new Error("Fork child 未成功持久化；未绑定 native child。");
+        },
+        remove: async (childId, harness) => {
+          await forgetHarnessSession(harness, childId);
+          await deleteSession(childId, []);
+        },
+        publish: (child, source) => {
+          if (child.providerSessionId) bindHarnessSession(child.harness, child.id, child.providerSessionId,
+            sessionWorkCwd(child), child.providerAccountId, child.blocks);
+          openSessionBeside(source.id, child, source.cwd, true);
+        },
+      });
+      forkRequestsRef.current.set(request.requestId, { key, result });
+      void result.then(request.resolve, request.reject);
+    };
+    window.addEventListener(SESSION_FORK_EVENT, receive);
+    return () => window.removeEventListener(SESSION_FORK_EVENT, receive);
+  }, [openSessionBeside, orchestrator]);
+
   const onSecondOpinion = useCallback(
     (sourceId: string, target: ModelTarget, turn: Block[]) => {
       const source = sessionsRef.current.find(
@@ -9304,12 +9461,15 @@ function Workspace({
       }
 
       let prompt: string;
+      let readContext: ReturnType<typeof btwContextReader> | undefined;
       try {
         prompt = buildBtwPrompt({
           blocks: input.source.blocks,
           thread: input.thread,
           cwd,
+          sourceSessionId: input.sessionId,
         });
+        readContext = harness === "codex" ? btwContextReader(input.source, input.thread, getSessionReferenceSnapshot) : undefined;
       } catch (error) {
         updateBtwThread(
           input.sessionId,
@@ -9353,6 +9513,20 @@ function Workspace({
         ephemeral: false,
         codexStore: isMonoSession(input.source.id) ? "mono" : undefined,
         threadId: input.thread.providerThreadId,
+        resumePrompt: buildBtwResumePrompt(input.thread, input.sessionId),
+        readContext,
+        onQueueState: (status) => {
+          if (controller.signal.aborted) return;
+          updateBtwThread(input.sessionId, input.userBlockId, input.thread.id, (thread) =>
+            thread && (thread.status === "queued" || thread.status === "running")
+              ? { ...thread, status, updatedAt: Date.now() } : thread);
+        },
+        onCancelError: (error) => {
+          const current = btwRequestsRef.current.get(key);
+          if (current && current.controller !== controller) return;
+          updateBtwThread(input.sessionId, input.userBlockId, input.thread.id, (thread) =>
+            thread?.status === "cancelled" ? { ...thread, error: error.message, updatedAt: Date.now() } : thread);
+        },
         onThreadId: (providerThreadId) => {
           if (controller.signal.aborted) return;
           updateBtwThread(
@@ -9526,21 +9700,21 @@ function Workspace({
           resolveModel(requestHarness!, selectedModel || source.model),
           source.modelSettings,
         );
-      if (existing?.status === "running") return false;
+      if (existing?.status === "running" || existing?.status === "queued") return false;
       if (existing && existing.sourceEndBlockId !== sourceEndBlockId) {
         return false;
+      }
+      if (!existing) {
+        try { completedSessionBoundary(source, sourceEndBlockId); }
+        catch { return false; }
       }
       const now = Date.now();
       const thread: BtwThread = existing
         ? {
-            ...existing,
+            ...queueBtwThread(existing, now),
             harness: existing.harness ?? turnHarness,
             model: selectedModel || undefined,
             modelSettings: selectedModelSettings,
-            status: "running",
-            updatedAt: now,
-            error: undefined,
-            pendingBlocks: [],
             messages: [
               ...existing.messages,
               { id: messageId, role: "user", text, createdAt: now },
@@ -9551,11 +9725,13 @@ function Workspace({
             sourceEndBlockId,
             createdAt: now,
             updatedAt: now,
-            status: "running",
+            status: "queued",
             pendingBlocks: [],
             harness: requestHarness,
             ...(selectedModel ? { model: selectedModel } : {}),
             modelSettings: selectedModelSettings,
+            readSources: sentSessionReferences(source.blocks.slice(0, source.blocks.findIndex((block) => block.id === sourceEndBlockId) + 1)),
+            contextScope: `as-of ${sourceEndBlockId}（含已完成轮次）；有限摘录、附件仅元数据。${requestHarness === "codex" ? "可用 monocode_read_context 只读补读截止点内主对话与所选来源；其他会话及写入不授权。" : "此 provider 没有会话补读工具，仅拥有有限摘录。"}`,
             messages: [{ id: messageId, role: "user", text, createdAt: now }],
           };
       const updated = updateBtwThread(
@@ -9660,7 +9836,7 @@ function Workspace({
   );
 
   // Stopping keeps whatever the side answer had streamed, like stopping a
-  // main turn, and leaves the thread ready for the next question.
+  // main turn, and records cancellation while allowing the next question.
   const onBtwStop = useCallback(
     (sessionId: string, turn: Block[], threadId: string) => {
       const sourceUserId = turn.find((block) => block.role === "user")?.id;
@@ -9669,45 +9845,7 @@ function Workspace({
       btwRequestsRef.current.get(key)?.controller.abort();
       btwRequestsRef.current.delete(key);
       updateBtwThread(sessionId, sourceUserId, threadId, (thread) => {
-        if (!thread || thread.status !== "running") return thread;
-        const harness = thread.harness;
-        const userMessageId =
-          thread.messages[thread.messages.length - 1]?.id ?? thread.id;
-        const pending = thread.pendingBlocks ?? [];
-        const blocks =
-          pending.length > 0 && harness
-            ? sealBtwResponseBlocks(
-                pending,
-                harness,
-                thread.model ?? "",
-                userMessageId,
-              )
-            : [];
-        const text = blocks
-          .filter((block) => block.role === "assistant")
-          .map((block) => block.text)
-          .join("\n\n")
-          .trim();
-        const now = Date.now();
-        return {
-          ...thread,
-          status: "ready",
-          updatedAt: now,
-          pendingBlocks: undefined,
-          error: undefined,
-          messages: blocks.length
-            ? [
-                ...thread.messages,
-                {
-                  id: crypto.randomUUID(),
-                  role: "assistant",
-                  text,
-                  createdAt: now,
-                  blocks,
-                },
-              ]
-            : thread.messages,
-        };
+        return thread ? cancelBtwThread(thread) : thread;
       });
     },
     [updateBtwThread],
@@ -9741,14 +9879,8 @@ function Workspace({
       ) {
         return;
       }
-      if (!sourceBlock || !existing || existing.status !== "error") return;
-      const thread: BtwThread = {
-        ...existing,
-        status: "running",
-        updatedAt: Date.now(),
-        error: undefined,
-        pendingBlocks: [],
-      };
+      if (!sourceBlock || !existing || (existing.status !== "error" && existing.status !== "cancelled")) return;
+      const thread = queueBtwThread(existing);
       const updated = updateBtwThread(
         sessionId,
         sourceUserId,
@@ -9960,7 +10092,7 @@ function Workspace({
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== sessionId) return s;
-          const stopped = stopStreaming(s);
+          const stopped = stopStreaming(s, Date.now(), "cancelled");
           const completed = isPreparingHandoff(stopped)
             ? completeHandoff(stopped, buildDeterministicHandoff(stopped))
             : stopped;
@@ -10037,6 +10169,8 @@ function Workspace({
     (sessionId: string, requestId: number, decision: ApprovalDecision) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session || session.worktreeRemoved) return;
+      if (session.blocks.some((block) => block.inherited && block.approval?.requestId === requestId) &&
+        !session.blocks.some((block) => !block.inherited && block.approval?.requestId === requestId && !block.approval.decided)) return;
       // An approval a habit's hidden run asked for, put to the user in the
       // Mono's chat: answer the run, and settle the question in the chat.
       if (isMonoSession(sessionId)) {
@@ -10135,7 +10269,9 @@ function Workspace({
       choices: () =>
         HARNESSES.filter(isHarnessAvailable).map((harness) => ({
           harness,
-          models: modelsFor(harness).map(({ id, name }) => ({ id, name })),
+          models: modelsFor(harness).map(({ id, name, settings }) => ({
+            id, name, settings,
+          })),
         })),
       createWorker: async (run, task) => {
         const projectCwd = orchestrationProjectCwd(run);
@@ -10175,6 +10311,14 @@ function Workspace({
                   ),
                 );
         const checkoutCwd = workspace.checkoutCwd;
+        if (task.workspacePolicy !== "shared") {
+          // New worktrees have just been seeded from the lead. Retained ones
+          // must already have a real baseline; never snapshot their results as
+          // though they were the initial state.
+          await ensureSessionCheckpoint(task.sessionId, checkoutCwd, {
+            worker: !task.workspace,
+          });
+        }
         const scratchDir = await invoke<string>("control_attach_worker", {
           leadId: run.leadId,
           sessionId: task.sessionId,
@@ -10287,6 +10431,10 @@ function Workspace({
           );
         await invoke("harness_kill", { sessionId: task.sessionId });
         await invoke("control_turn_finished", { sessionId: task.sessionId });
+        await finishSessionTurn(task.sessionId, fromCwd, {
+          recover: true,
+          required: true,
+        });
         await flushSessionCheckpoint(task.sessionId);
         const listed = await listWorktrees(orchestrationCheckoutCwd(run));
         const workerTree = listed.worktrees.find((tree) =>
@@ -10307,6 +10455,7 @@ function Workspace({
           task.sessionId,
           fromCwd,
           orchestrationCheckoutCwd(run),
+          task.files,
         );
       },
       cleanupWorker: async (run, task, onlyIfUnchanged) => {
@@ -10344,11 +10493,12 @@ function Workspace({
             task.sessionId,
             path,
             orchestrationCheckoutCwd(run),
+            task.files,
           );
         }
 
         if (exists) {
-          onStop(task.sessionId, true);
+          await onStop(task.sessionId, true);
           const session = sessionsRef.current.find(
             (entry) => entry.id === task.sessionId,
           );
@@ -10474,10 +10624,10 @@ function Workspace({
         if (session)
           respondHarnessQuestion(session.harness, id, requestId, reply);
       },
-      stop: async (id) => {
+      stop: async (id, worker) => {
         const session = sessionsRef.current.find((entry) => entry.id === id);
-        onStop(id, true);
         try {
+          await onStop(id, true);
           if (session)
             await Promise.all(
               sessionChildHarnesses(session).map((harness) =>
@@ -10490,9 +10640,18 @@ function Workspace({
           await invoke("harness_kill", { sessionId: id });
           await invoke("control_turn_finished", { sessionId: id });
         }
+        try {
+          await finishStoppedWorkerCheckpoint(id, session, worker);
+        } catch (error) {
+          return {
+            checkpointError: error instanceof Error ? error.message : String(error),
+          };
+        }
       },
     });
   }, [checkOpenWorktreeFiles, submitSession, onStop, flushHarnessEvents]);
+
+  useOrchestrationRestore(sessions, remoteProjectFor);
 
   useEffect(() => {
     orchestrator.sync();
@@ -10526,12 +10685,7 @@ function Workspace({
         const source = sessionsRef.current.find(
           (session) => session.id === payload.sessionId,
         );
-        if (
-          !source ||
-          source.inboxAsk ||
-          source.orchestrationLeadId ||
-          orchestrator.run(source.id)
-        )
+        if (!agentAppSourceAllowed(source, source ? orchestrator.run(source.id) : undefined))
           throw new Error("This session cannot use the MonoCode app CLI");
         const key = `${source.id}:${payload.requestId}`;
         const signature = JSON.stringify([payload.action, payload.input]);
@@ -10728,6 +10882,8 @@ function Workspace({
               isMonoSession(target.id)
                 ? readMonoConversation(target, options)
                 : sessionConversationPage(target, options),
+            savedSession: getSessionReferenceSnapshot,
+            exportConversation: exportSessionReference,
             send: async (id, prompt, requestId, notifyMonoId) => {
               const target = await ensureOpenSessionRef.current(id);
               if (
@@ -10930,6 +11086,7 @@ function Workspace({
             writeAgentFile: (monoId, path, text, hash) =>
               writeAgentFile(monoId, path, text, hash),
           },
+          operatorEnabledInThread(source.blocks) || isMonoSession(source.id) ? "operator" : "references",
         );
         appReceipts.current.set(key, { signature, promise });
         void promise.catch(() => {
@@ -10955,6 +11112,10 @@ function Workspace({
               response: {
                 ok: false,
                 error: error instanceof Error ? error.message : String(error),
+                ...(error instanceof SessionBlocksVersionError ? {
+                  code: error.code, expectedReadVersion: error.expectedReadVersion,
+                  readVersion: error.actualReadVersion, updatedAt: error.updatedAt, retryable: false,
+                } : {}),
               },
             }),
         )

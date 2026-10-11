@@ -25,6 +25,12 @@ struct TurnReview {
     repo: String,
     active: Option<RecordedTurn>,
     latest: Option<RecordedTurn>,
+    /// Immutable initial before state and the latest settled worker result.
+    /// Ordinary sessions continue to review one turn at a time.
+    #[serde(default)]
+    worker: Option<RecordedTurn>,
+    #[serde(default)]
+    worker_retired: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +56,16 @@ struct Change {
 }
 
 impl CheckpointStore {
+    pub(super) fn retire_worker(&self, session: &str, cwd: &str) -> Result<(), String> {
+        if let Some(mut review) = self.matching_turn_review(session, cwd)? {
+            // Retain the original baseline/result for manual review, but never
+            // append independent conversation turns to the worker's result.
+            review.worker_retired = true;
+            write_review(&self.session_dir(session), &review)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_turn(&self, session_id: &str, cwd: &str, id: &str) -> Result<(), String> {
         let root = std::fs::canonicalize(project_root(cwd)?).map_err(|e| e.to_string())?;
         let discovered = run_git(&root, &["rev-parse", "--show-toplevel"]);
@@ -69,6 +85,8 @@ impl CheckpointStore {
                 repo: String::new(),
                 active: None,
                 latest: None,
+                worker: None,
+                worker_retired: false,
             });
         let mut turn = RecordedTurn {
             id: id.into(),
@@ -92,18 +110,26 @@ impl CheckpointStore {
                 .to_string();
             // Shared checkouts can include another session's writes. Keep the
             // recorded diff exact, but never offer to restore those turns.
-            for (other_dir, mut other) in self.active_turns(&root, session_id)? {
-                turn.shared = true;
-                if let Some(active) = other.active.as_mut() {
-                    active.shared = true;
-                }
-                write_review(&other_dir, &other)?;
-            }
+            turn.shared = self.mark_active_turns_shared(&root, session_id)?;
             capture_workspace(&root, &turn_ref(session_id, id, "before"))
         })();
         match capture {
             Ok(oid) => turn.before = Some(oid),
             Err(error) => turn.error = Some(error),
+        }
+        if let Some(worker) = review.worker.as_mut().filter(|_| !review.worker_retired) {
+            if let Some(error) = &worker.error {
+                return Err(error.clone());
+            }
+            if turn.error.is_none()
+                && (turn.shared
+                    || turn.head != worker.head
+                    || !same_tree(&root, turn.before.as_deref(), worker.after.as_deref())?)
+            {
+                let error = "The worker checkout changed between recorded turns. Its original baseline and files were kept for manual review.".to_string();
+                worker.error = Some(error.clone());
+                turn.error = Some(error);
+            }
         }
         review.active = Some(turn.clone());
         write_review(&dir, &review)?;
@@ -136,12 +162,240 @@ impl CheckpointStore {
                 turn: turn.clone(),
             },
         )?;
+        if let Some(worker) = review.worker.as_mut().filter(|_| !review.worker_retired) {
+            if worker.error.is_none() {
+                worker.after = turn.after.clone();
+                worker.shared |= turn.shared;
+                worker.error = turn.error.clone();
+            }
+        }
         review.latest = Some(turn);
         write_review(&dir, &review)?;
         match error {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub(super) fn finish_saved_turn(
+        &self,
+        session: &str,
+        cwd: &str,
+        id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(review) = self.matching_turn_review(session, cwd)? else {
+            return Ok(());
+        };
+        let Some(active) = review.active else {
+            return Ok(());
+        };
+        if id.is_some_and(|id| id != active.id) {
+            return Ok(());
+        }
+        validate_id(&active.id, "turn")?;
+        // The caller first stops the provider. A renderer reload can lose its
+        // token, but only this already saved turn may have its after captured.
+        self.finish_turn(session, cwd, &active.id)
+    }
+
+    pub(super) fn ensure_worker(
+        &self,
+        session: &str,
+        cwd: &str,
+        fresh: bool,
+    ) -> Result<(), String> {
+        if let Some(review) = self.matching_turn_review(session, cwd)? {
+            if review.worker_retired {
+                return Err("This worker was continued independently. Its original result was retained for manual review.".into());
+            }
+            if let Some(worker) = review.worker {
+                if let Some(error) = worker.error {
+                    return Err(error);
+                }
+                if worker.before.is_none() {
+                    return Err(NO_WORKER_BASELINE.into());
+                }
+                return Ok(());
+            }
+            if fresh {
+                return Err(
+                    "This worker already has recordings. Its initial baseline was not replaced."
+                        .into(),
+                );
+            }
+            // The only legacy turn migration we can establish without guessing
+            // order is a single real saved turn. Multiple turns without an
+            // initial worker recording are retained for manual review.
+            let worker = self.single_worker_turn(session, &review)?;
+            write_review(
+                &self.session_dir(session),
+                &TurnReview {
+                    worker: Some(worker),
+                    ..review
+                },
+            )?;
+            return Ok(());
+        }
+        let dir = self.session_dir(session);
+        if !fresh || read_manifest(&dir)?.is_some() || read_review(&dir)?.is_some() {
+            return Err(NO_WORKER_BASELINE.into());
+        }
+        // createWorker has just seeded this checkout; this completes before
+        // attachment or any provider write. Later turns never change before.
+        self.begin_turn(session, cwd, "worker-baseline")?;
+        self.finish_turn(session, cwd, "worker-baseline")?;
+        let mut review = self
+            .matching_turn_review(session, cwd)?
+            .ok_or(NO_WORKER_BASELINE)?;
+        review.worker = Some(completed_turn(&review)?.clone());
+        write_review(&self.session_dir(session), &review)
+    }
+
+    fn single_worker_turn(
+        &self,
+        session: &str,
+        review: &TurnReview,
+    ) -> Result<RecordedTurn, String> {
+        let turn = completed_turn(review)?;
+        let history = self.session_dir(session).join("turns");
+        if !history.is_dir() {
+            return Err(NO_WORKER_BASELINE.into());
+        }
+        let mut found = false;
+        for entry in std::fs::read_dir(history).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let saved: SavedTurn =
+                serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if saved.cwd != review.cwd
+                || saved.turn.id != turn.id
+                || saved.turn.before != turn.before
+                || saved.turn.after != turn.after
+            {
+                return Err("The original worker baseline cannot be established from multiple legacy turns. Its recordings and files were kept for manual review.".into());
+            }
+            found = true;
+        }
+        if !found {
+            return Err(NO_WORKER_BASELINE.into());
+        }
+        Ok(turn.clone())
+    }
+
+    pub(super) fn recorded_worker_delta(
+        &self,
+        session: &str,
+        cwd: &str,
+    ) -> Result<Option<WorkerDelta>, String> {
+        let Some(review) = self.matching_turn_review(session, cwd)? else {
+            return Ok(None);
+        };
+        if review.worker_retired {
+            return Err("This worker was continued independently. Its original result was retained for manual review.".into());
+        }
+        let latest = completed_turn(&review)?;
+        let worker = match &review.worker {
+            Some(worker) => worker.clone(),
+            None => self.single_worker_turn(session, &review)?,
+        };
+        if let Some(error) = &worker.error {
+            return Err(format!("Cannot safely integrate worker changes: {error}"));
+        }
+        let root = Path::new(&review.cwd);
+        if worker.shared
+            || latest.shared
+            || worker.after != latest.after
+            || worker.head != latest.head
+            || worker.head.as_ref().is_none_or(|head| {
+                run_git(root, &["rev-parse", "--verify", "HEAD"])
+                    .map_or(true, |bytes| String::from_utf8_lossy(&bytes).trim() != head)
+            })
+        {
+            return Err("Cannot integrate a shared, moved or incomplete worker checkpoint. Its files were kept.".into());
+        }
+        let changed = changes(root, &worker)?;
+        // Verify inherited dirty files too, using blob hashes and modes. Do
+        // not read their contents or impose the text-size limit on unchanged
+        // inherited files; only actual changes will be materialized below.
+        let head_to_result = RecordedTurn {
+            before: worker.head.clone(),
+            ..worker.clone()
+        };
+        let mut verify: BTreeMap<_, _> = changes(root, &head_to_result)?
+            .into_iter()
+            .map(|change| (change.relative.clone(), change))
+            .collect();
+        for args in [
+            vec![
+                "diff",
+                "--name-only",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "-z",
+                "HEAD",
+                "--",
+            ],
+            vec!["ls-files", "--others", "--exclude-standard", "-z"],
+        ] {
+            for path in run_git(root, &args)?
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                let relative =
+                    resolve_turn_path(std::str::from_utf8(path).map_err(|e| e.to_string())?)?;
+                if !verify.contains_key(&relative) {
+                    let blob = blob_at(
+                        root,
+                        worker.after.as_deref().ok_or(NO_WORKER_BASELINE)?,
+                        &relative,
+                    )?;
+                    verify.insert(
+                        relative.clone(),
+                        Change {
+                            relative,
+                            before: None,
+                            after: blob,
+                            status: String::new(),
+                            additions: 0,
+                            deletions: 0,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(change) = verify.values().find(|change| !restorable(root, change)) {
+            return Err(format!("Cannot safely integrate {}: it changed after the worker checkpoint. The worker worktree was kept.", change.relative));
+        }
+        let mut files = Vec::new();
+        for change in changed {
+            let state = |blob: Option<&Blob>| -> Result<_, String> {
+                let contents = read_blob(root, blob)?;
+                if matches!(contents, FileState::Skipped)
+                    || blob.is_some_and(|blob| !matches!(blob.mode.as_str(), "100644" | "100755"))
+                {
+                    return Err(format!("Cannot integrate {}: unsupported file type or size. The worker worktree was kept.", change.relative));
+                }
+                let mode = if cfg!(unix) {
+                    blob.map(|blob| if blob.mode == "100755" { 0o755 } else { 0o644 })
+                } else {
+                    None
+                };
+                Ok((contents, mode))
+            };
+            files.push(WorkerChange {
+                before: state(change.before.as_ref())?,
+                after: state(change.after.as_ref())?,
+                relative: change.relative,
+            });
+        }
+        Ok(Some(WorkerDelta {
+            files,
+            git_modes: true,
+        }))
     }
 
     pub(super) fn has_turn_review(&self, session_id: &str, cwd: &str) -> Result<bool, String> {
@@ -165,7 +419,10 @@ impl CheckpointStore {
         root: &Path,
         except: &str,
     ) -> Result<Vec<(PathBuf, TurnReview)>, String> {
-        let root = review_comparison_path(root);
+        // Turn records store canonical cwd; integration may arrive through a
+        // checkout alias (including macOS /var -> /private/var).
+        let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+        let root = review_comparison_path(&root);
         let mut active = Vec::new();
         if !self.root.exists() {
             return Ok(active);
@@ -184,6 +441,22 @@ impl CheckpointStore {
             }
         }
         Ok(active)
+    }
+
+    pub(super) fn mark_active_turns_shared(
+        &self,
+        root: &Path,
+        except: &str,
+    ) -> Result<bool, String> {
+        let active = self.active_turns(root, except)?;
+        let shared = !active.is_empty();
+        for (dir, mut review) in active {
+            if let Some(turn) = review.active.as_mut() {
+                turn.shared = true;
+            }
+            write_review(&dir, &review)?;
+        }
+        Ok(shared)
     }
 
     pub(super) fn turn_status(
@@ -402,6 +675,37 @@ fn completed_turn(review: &TurnReview) -> Result<&RecordedTurn, String> {
 
 fn turn_ref(session: &str, turn: &str, side: &str) -> String {
     format!("refs/monocode/checkpoints/{session}/{turn}/{side}")
+}
+
+fn same_tree(root: &Path, left: Option<&str>, right: Option<&str>) -> Result<bool, String> {
+    let tree = |oid: Option<&str>| {
+        let oid = oid.ok_or(NO_WORKER_BASELINE)?;
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Invalid saved checkpoint object".into());
+        }
+        run_git(root, &["rev-parse", "--verify", &format!("{oid}^{{tree}}")])
+    };
+    Ok(tree(left)? == tree(right)?)
+}
+
+fn blob_at(root: &Path, commit: &str, relative: &str) -> Result<Option<Blob>, String> {
+    let output = run_git(root, &["ls-tree", "-z", commit, "--", relative])?;
+    let Some(row) = output.split(|byte| *byte == 0).find(|row| !row.is_empty()) else {
+        return Ok(None);
+    };
+    let mut fields = row.splitn(2, |byte| *byte == b'\t');
+    let header = std::str::from_utf8(fields.next().unwrap()).map_err(|e| e.to_string())?;
+    if fields.next() != Some(relative.as_bytes()) {
+        return Err("Invalid checkpoint path".into());
+    }
+    let parts: Vec<_> = header.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err("Invalid checkpoint object".into());
+    }
+    Ok(Some(Blob {
+        mode: parts[0].into(),
+        oid: parts[2].into(),
+    }))
 }
 
 // Git's NUL-delimited output already contains literal paths. Never trim them

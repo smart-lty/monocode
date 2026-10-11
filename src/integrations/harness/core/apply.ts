@@ -32,6 +32,7 @@ export function applyHarnessEvents(
   let next = session;
   for (let index = 0; index < events.length; index++) {
     const event = events[index];
+    if (isLateEndedTurnEvent(next, event)) continue;
     if (event.type !== "message.delta" && event.type !== "reasoning.delta") {
       next = applyHarnessEvent(next, event);
       continue;
@@ -57,6 +58,7 @@ export function applyHarnessEvent(
   session: Session,
   event: HarnessEvent,
 ): Session {
+  if (isLateEndedTurnEvent(session, event)) return session;
   switch (event.type) {
     case "message.delta":
       return patchStreaming(session, "assistant", event.text, true);
@@ -90,7 +92,7 @@ export function applyHarnessEvent(
         detail: event.detail,
         input: event.input,
         preview: event.preview,
-        streaming: event.status !== "completed" && event.status !== "failed",
+        streaming: !isTerminalToolStatus(event.status),
         agentModel: event.agentModel,
       });
     case "agent.step":
@@ -99,7 +101,7 @@ export function applyHarnessEvent(
       return attachApproval(session, event);
     case "approval.resolved": {
       const blocks = session.blocks.map((block) =>
-        block.approval?.requestId === event.requestId
+        !block.inherited && block.approval?.requestId === event.requestId
           ? {
               ...block,
               approval: { ...block.approval, decided: event.decision },
@@ -174,20 +176,54 @@ export function applyHarnessEvent(
       );
     case "session.providerBound":
       return { ...session, providerSessionId: event.providerSessionId };
+    case "turn.cancelled": {
+      const user = session.blocks[currentTurnUserIndex(session)];
+      // A delayed abort belongs to its original native turn, never a new one.
+      if (event.providerTurnId && user?.providerTurnId !== event.providerTurnId)
+        return session;
+      return stopStreaming(session, Date.now(), "cancelled");
+    }
     case "turn.started": {
       const index = lastMatchingBlock(
         session.blocks,
         (block) =>
           block.role === "user" &&
+          !block.inherited &&
+          !block.draft &&
           !session.queuedMessages?.some(
             (message) => message.blockId === block.id,
           ),
       );
       if (index < 0) return session;
       const block = session.blocks[index];
-      if (block.providerTurnId === event.providerTurnId) return session;
+      if (block.providerTurnId === event.providerTurnId && block.nativeContext?.sessionId === session.providerSessionId) return session;
       const blocks = session.blocks.slice();
-      blocks[index] = { ...block, providerTurnId: event.providerTurnId };
+      blocks[index] = { ...block, providerTurnId: event.providerTurnId,
+        ...(session.harness === "codex" && session.providerSessionId ? { nativeContext: {
+          harness: "codex" as const, sessionId: session.providerSessionId,
+          turnId: event.providerTurnId, source: "provider" as const,
+        } } : {}),
+      };
+      return { ...session, blocks };
+    }
+    case "turn.nativeContext": {
+      const index = lastMatchingBlock(session.blocks, (block) => block.role === "user" && !block.inherited &&
+        !block.draft && !session.queuedMessages?.some((message) => message.blockId === block.id));
+      if (index < 0) return session;
+      const blocks = session.blocks.slice();
+      const previous = blocks[index].nativeContext;
+      const context = event.context;
+      const sameTurn = previous?.harness === context.harness && previous.sessionId === context.sessionId &&
+        (!context.userMessageId || !previous.userMessageId || context.userMessageId === previous.userMessageId);
+      const userMessageId = context.userMessageId ?? (sameTurn ? previous?.userMessageId : undefined);
+      blocks[index] = { ...blocks[index], nativeContext: {
+        ...context,
+        ...(context.harness === "opencode" ? {
+          userMessageId,
+          messageIds: [...new Set([...(userMessageId ? [userMessageId] : []), ...(sameTurn ? previous?.messageIds ?? [] : []),
+            ...(context.messageIds ?? [])])],
+        } : {}),
+      } };
       return { ...session, blocks };
     }
     case "turn.ready":
@@ -295,7 +331,7 @@ function upsertPlan(
     (block) => block.role === "user",
   );
   const existing = lastMatchingBlock(session.blocks, (block, index) => {
-    if (block.role !== "plan") return false;
+    if (block.inherited || block.role !== "plan") return false;
     if (key) {
       return block.plan?.key === key || (!block.plan?.key && index > lastUser);
     }
@@ -347,7 +383,7 @@ function upsertTaskList(
     (block) => block.role === "user",
   );
   const existing = lastMatchingBlock(session.blocks, (block, index) => {
-    if (block.role !== "tasks") return false;
+    if (block.inherited || block.role !== "tasks") return false;
     if (key) {
       if (block.taskList?.key !== key) return false;
       // A list from another provider conversation stays as history.
@@ -465,6 +501,7 @@ function lastMatchingBlock(
 }
 
 type UserTurnExtra = {
+  sessionReferences?: Block["sessionReferences"];
   secondOpinion?: Block["secondOpinion"];
   noteCard?: Block["noteCard"];
   ciContext?: string;
@@ -477,6 +514,7 @@ type UserTurnExtra = {
 
 function userTurnFields(extra?: UserTurnExtra) {
   return {
+    ...(extra?.sessionReferences?.length ? { sessionReferences: extra.sessionReferences } : {}),
     ...(extra?.secondOpinion ? { secondOpinion: extra.secondOpinion } : {}),
     ...(extra?.noteCard ? { noteCard: extra.noteCard } : {}),
     ...(extra?.ciContext ? { ciContext: extra.ciContext } : {}),
@@ -547,7 +585,42 @@ export function appendSteerUser(
   };
 }
 
-export function stopStreaming(session: Session, endedAt = Date.now()): Session {
+function currentTurnUserIndex(session: Session): number {
+  return lastMatchingBlock(session.blocks, (block) =>
+    block.role === "user" && !block.inherited && !block.draft &&
+    block.sentAt == null && !session.queuedMessages?.some((message) => message.blockId === block.id),
+  );
+}
+
+function isTerminalToolStatus(status?: string): boolean {
+  return ["completed", "success", "failed", "error", "cancelled", "canceled", "interrupted"]
+    .includes(status?.toLowerCase() ?? "");
+}
+
+function isLateEndedTurnEvent(session: Session, event: HarnessEvent): boolean {
+  if (session.busy || !session.blocks[currentTurnUserIndex(session)]?.turnOutcome)
+    return false;
+  // Buffered content cannot reopen an interrupted turn. Connection metadata
+  // can still settle; appendUser starts the next turn before its events arrive.
+  return !["session.started", "session.ended", "session.providerBound",
+    "session.configChanged", "context", "usage.limited"].includes(event.type);
+}
+
+export function stopStreaming(
+  session: Session,
+  endedAt = Date.now(),
+  outcome?: Block["turnOutcome"],
+): Session {
+  const userIndex = currentTurnUserIndex(session);
+  const user = session.blocks[userIndex];
+  const interrupted = outcome && session.busy && user?.durationMs == null;
+  // Btw applies events to a temporary session without a busy flag. Its open
+  // tools still need a terminal status, without marking an older finished user.
+  const openTools = new Set(outcome && user?.durationMs == null ? session.blocks.slice(Math.max(0, userIndex))
+    .filter((block) => !block.inherited && block.tool &&
+      !isTerminalToolStatus(block.tool.status) &&
+      (block.streaming || ["in_progress", "pending", "running"].includes(block.tool.status?.toLowerCase() ?? "")))
+    .map((block) => block.id) : []);
   const { backgroundTasks: _cleared, ...settled } =
     settlePendingApprovals(session);
   return {
@@ -555,7 +628,13 @@ export function stopStreaming(session: Session, endedAt = Date.now()): Session {
     busy: false,
     turnReady: false,
     pendingQuestion: undefined,
-    blocks: stampTurnDuration(settled.blocks.map(stopBlockProgress), endedAt),
+    blocks: stampTurnDuration(settled.blocks.map((block) => {
+      const stopped = stopBlockProgress(block);
+      if (interrupted && block.id === user?.id) return { ...stopped, turnOutcome: outcome };
+      return openTools.has(block.id) && stopped.tool
+        ? { ...stopped, tool: { ...stopped.tool, status: outcome === "error" ? "failed" : "cancelled" } }
+        : stopped;
+    }), endedAt),
   };
 }
 
@@ -599,37 +678,7 @@ function settlePendingApprovals(session: Session): Session {
  * failure behind a neutral completed-turn summary.
  */
 function failStreaming(session: Session): Session {
-  const openTools = new Set(
-    session.blocks.flatMap((block) => {
-      if (block.role !== "tool" && block.role !== "approval") return [];
-      const status = block.tool?.status?.toLowerCase() ?? "";
-      return block.streaming ||
-        status === "in_progress" ||
-        status === "pending" ||
-        status === "running"
-        ? [block.id]
-        : [];
-    }),
-  );
-  const stopped = stopStreaming(session);
-  return {
-    ...stopped,
-    blocks: stopped.blocks.map((block) => {
-      const open = openTools.has(block.id);
-      const pendingApproval = !!block.approval && !block.approval.decided;
-      if (!open && !pendingApproval) return block;
-      return {
-        ...block,
-        streaming: false,
-        ...(block.tool && open
-          ? { tool: { ...block.tool, status: "failed" } }
-          : {}),
-        ...(block.approval && !block.approval.decided
-          ? { approval: { ...block.approval, decided: "cancelled" as const } }
-          : {}),
-      };
-    }),
-  };
+  return stopStreaming(session, Date.now(), "error");
 }
 
 /**
@@ -686,6 +735,7 @@ export function promoteLastAssistantToPlan(
 }
 
 function stopBlockProgress(block: Block): Block {
+  if (block.inherited) return block;
   let stopped = block.streaming ? { ...block, streaming: false } : block;
   if (stopped.orchestration?.status === "planning") {
     stopped = {
@@ -940,7 +990,7 @@ function findToolForApproval(
 ): number {
   if (event.callId) {
     const byId = session.blocks.findIndex(
-      (block) => block.tool?.callId === event.callId,
+      (block) => !block.inherited && block.tool?.callId === event.callId,
     );
     if (byId >= 0) return byId;
   }
@@ -948,7 +998,7 @@ function findToolForApproval(
   const unmatched: number[] = [];
   for (let i = session.blocks.length - 1; i >= 0; i--) {
     const block = session.blocks[i];
-    if (block.role !== "tool" || block.approval) continue;
+    if (block.inherited || block.role !== "tool" || block.approval) continue;
     unmatched.push(i);
     const label = normalizeLabel(block.text || block.tool?.title || "");
     if (needle && label === needle) return i;
@@ -1230,14 +1280,14 @@ function findToolIndex(
 ): number {
   if (patch.callId) {
     const byId = session.blocks.findIndex(
-      (block) => block.tool?.callId === patch.callId,
+      (block) => !block.inherited && block.tool?.callId === patch.callId,
     );
     if (byId >= 0) return byId;
   }
   const needle = normalizeLabel(patch.title || "");
   if (!needle) return -1;
   return session.blocks.findIndex((block) => {
-    if (block.role !== "tool" || !block.approval || block.tool?.callId) {
+    if (block.inherited || block.role !== "tool" || !block.approval || block.tool?.callId) {
       return false;
     }
     return normalizeLabel(block.text || block.tool?.title || "") === needle;

@@ -7,6 +7,7 @@ import {
   Copy,
   FilePlusCorner,
   ListBullet,
+  MessageSquare,
   Minus,
   Pencil,
   PenLine,
@@ -32,6 +33,7 @@ import {
   type RefObject,
 } from "react";
 import { flushSync } from "react-dom";
+import { SessionReferenceChips } from "./SessionReferenceChip";
 import { AttachmentChip } from "./AttachmentChip";
 import { GeneratedImage } from "./GeneratedImage";
 import { MonocodeSparkles } from "./MonocodeSparkles";
@@ -44,6 +46,8 @@ import { PlanPreview } from "./PlanPreview";
 import { OrchestrationPreview } from "../../orchestration/ui/OrchestrationPreview";
 import { TaskListPreview } from "./TaskListPreview";
 import { HandoffButton, SecondOpinionButton } from "./SecondOpinionButton";
+import { ForkButton, ForkOriginNotice, ForkRecoveryNotice, type TurnFork } from "./ForkButton";
+import { turnLabel, type ForkMenu } from "./forkChoices";
 import { SecondOpinionCard } from "./SecondOpinionCard";
 import { NoteMiniCard } from "../../notes/ui/NoteMiniCard";
 import { ArtifactCard } from "../../artifacts/ui/ArtifactCard";
@@ -224,6 +228,8 @@ type Props = {
   backgroundTasks?: string[];
   onApproval?: (requestId: number, decision: ApprovalDecision) => void;
   onAddToChat?: (text: string) => void;
+  /** Names the selection action when it goes somewhere other than this chat. */
+  addToChatLabel?: string;
   onSaveNote?: (text: string) => void | Promise<void>;
   onSendDraft?: (block: Block) => boolean | void;
   onRemoveDraft?: (block: Block) => boolean | void;
@@ -236,6 +242,20 @@ type Props = {
   planBuildTargets?: boolean;
   onSecondOpinion?: (target: ModelTarget, turn: Block[]) => void;
   onHandoff?: (target: ModelTarget, turn: Block[]) => void;
+  /** Fork a completed turn into an independent session beside this one. */
+  fork?: TurnFork;
+  /** Open a read-only side question as of this turn, or say why not. */
+  sideQuestion?: {
+    open: (turn: Block[]) => void;
+    unavailable: (turn: Block[]) => string | undefined;
+  };
+  /** The readable title of a session, for a fork's origin card. */
+  sessionTitle?: (sessionId: string) => string | undefined;
+  /**
+   * A turn that ended without finishing (stopped or interrupted). It reads
+   * as that outcome, never as completed work with a duration.
+   */
+  turnOutcome?: { userBlockId: string; label: string };
   onEditLastTurn?: () => void;
   editingLastTurn?: boolean;
   onJumpToBottomChange?: (show: boolean) => void;
@@ -287,6 +307,7 @@ function AgentTranscriptComponent({
   backgroundTasks,
   onApproval,
   onAddToChat,
+  addToChatLabel,
   onSaveNote,
   onSendDraft,
   onRemoveDraft,
@@ -299,6 +320,10 @@ function AgentTranscriptComponent({
   planBuildTargets = true,
   onSecondOpinion,
   onHandoff,
+  fork,
+  sideQuestion,
+  sessionTitle,
+  turnOutcome,
   onEditLastTurn,
   editingLastTurn = false,
   onJumpToBottomChange,
@@ -312,11 +337,38 @@ function AgentTranscriptComponent({
   onScrollerChange,
   managed = false,
 }: Props) {
+  // A fork writes a plain note after its inherited history. The origin card
+  // says the same, so it takes the note's place after the block before it.
+  const forkNote = useMemo(() => {
+    const inherited = sourceBlocks.find(
+      (block) => block.role === "user" && block.forkOrigin,
+    );
+    const origin = sourceBlocks.find((block) => block.forkOrigin)?.forkOrigin;
+    if (!origin) return null;
+    // An unbound record holds only a hidden note and its error; the card
+    // leads the first visible row, and the error stays as written.
+    if (origin.recovery) {
+      const first = sourceBlocks.find((block) => !block.internal);
+      return first ? { origin, inherited, anchorId: first.id } : null;
+    }
+    let index = 0;
+    sourceBlocks.forEach((block, at) => {
+      if (block.inherited) index = at + 1;
+    });
+    while (sourceBlocks[index]?.role === "handoff") index += 1;
+    const note = sourceBlocks[index];
+    const anchor = sourceBlocks[index - 1];
+    if (note?.role !== "system" || note.inherited || !anchor) return null;
+    return { origin, inherited, anchorId: anchor.id, noteId: note.id };
+  }, [sourceBlocks]);
   const blocks = useMemo(() => {
-    if (!harness || !supportsHarnessLogin(harness)) return sourceBlocks;
+    const login = !!harness && supportsHarnessLogin(harness);
+    if (!login && !forkNote?.noteId) return sourceBlocks;
     const visibleBlocks = sourceBlocks.filter(
       (block) =>
+        block.id !== forkNote?.noteId &&
         !(
+          login &&
           block.role === "system" &&
           block.notice === "error" &&
           isHarnessAuthError(block.text)
@@ -325,7 +377,30 @@ function AgentTranscriptComponent({
     return visibleBlocks.length === sourceBlocks.length
       ? sourceBlocks
       : visibleBlocks;
-  }, [harness, sourceBlocks]);
+  }, [harness, sourceBlocks, forkNote]);
+  const forkNotice = useMemo(() => {
+    if (!forkNote) return null;
+    const { origin, inherited, anchorId } = forkNote;
+    const sourceTitle = sessionTitle?.(origin.sourceSessionId);
+    return {
+      id: anchorId,
+      element: origin.recovery ? (
+        <ForkRecoveryNotice
+          origin={origin}
+          recovery={origin.recovery}
+          sourceTitle={sourceTitle}
+        />
+      ) : (
+        <ForkOriginNotice
+          origin={origin}
+          blocks={blocks}
+          inherited={inherited}
+          sourceTitle={sourceTitle}
+          checkout={cwd}
+        />
+      ),
+    };
+  }, [forkNote, blocks, cwd, sessionTitle]);
   const editableUserBlockId = useMemo(
     () => lastUserTurnBlock(blocks)?.id,
     [blocks],
@@ -996,8 +1071,18 @@ function AgentTranscriptComponent({
           // standalone reply still needs its identity and response actions.
           const standaloneReply =
             !userBlock && !!(agentName || habit) && turn.some(isProseBlock);
-          const durationMs =
-            runs.length > 1
+          const outcome =
+            turnOutcome && userBlock?.id === turnOutcome.userBlockId
+              ? turnOutcome.label
+              : userBlock?.turnOutcome === "cancelled"
+                ? "Stopped"
+                : userBlock?.turnOutcome === "error"
+                  ? "Failed"
+                  : undefined;
+          // Waiting and stopping time is not work, so an outcome has none.
+          const durationMs = outcome
+            ? undefined
+            : runs.length > 1
               ? sumDurations(
                   runs.map(
                     (run) =>
@@ -1100,6 +1185,8 @@ function AgentTranscriptComponent({
             ) : agentMascot && agentName ? (
               // A Mono signs its settled turns with just its mascot and name.
               <span className="font-medium text-content/80">{agentName}</span>
+            ) : outcome ? (
+              outcome
             ) : durationMs != null ? (
               formatWorkingDuration(durationMs, turnModelName, true)
             ) : inlineWork && turnModelName ? (
@@ -1112,6 +1199,7 @@ function AgentTranscriptComponent({
             standaloneReply ||
             live ||
             durationMs != null ||
+            !!outcome ||
             (inlineWork
               ? items.some(
                   (item) => item.type !== "block" || item.block.role !== "user",
@@ -1420,20 +1508,25 @@ function AgentTranscriptComponent({
                   ))}
                 </div>
               ) : null}
+              {forkNotice && turn.some((block) => block.id === forkNotice.id)
+                ? forkNotice.element
+                : null}
               {/* The accessory keeps the pane's props, which go stale once parked. */}
               {isLastTurn && latestTurnAccessory && !parked
                 ? latestTurnAccessory
                 : null}
               {settled &&
               (durationMs != null ||
+                !!outcome ||
                 standaloneReply ||
                 (inlineWork && firstWork >= 0) ||
                 (spawnedSessions.length > 0 && onShowSessions)) ? (
                 <TurnDuration
                   elapsedMs={durationMs ?? null}
                   label={
-                    standaloneReply ? (agentName ?? habit?.name) : undefined
+                    standaloneReply ? (agentName ?? habit?.name) : outcome
                   }
+                  ended={!!outcome}
                   metrics={hideTurnMetrics ? undefined : userBlock?.turnMetrics}
                   labelHidden={showFoldLine}
                   modelName={turnModelName}
@@ -1477,6 +1570,25 @@ function AgentTranscriptComponent({
                   onHandoff={
                     onHandoff ? (target) => onHandoff(target, turn) : undefined
                   }
+                  fork={
+                    fork && userBlock && !userBlock.draft && !userBlock.internal
+                      ? {
+                          turnLabel:
+                            turnLabel(blocks, userBlock.id)?.label ?? "this turn",
+                          checkout: fork.checkout,
+                          menu: () => fork.menu(userBlock.id),
+                          run: fork.run,
+                        }
+                      : undefined
+                  }
+                  sideQuestion={
+                    sideQuestion && userBlock && !userBlock.draft
+                      ? {
+                          open: () => sideQuestion.open(turn),
+                          unavailable: () => sideQuestion.unavailable(turn),
+                        }
+                      : undefined
+                  }
                 />
               ) : null}
             </div>
@@ -1487,6 +1599,7 @@ function AgentTranscriptComponent({
         <TranscriptSelectionMenu
           selection={selection}
           onAddToChat={onAddToChat}
+          addToChatLabel={addToChatLabel}
           onAddToNotes={onSaveSelectionNote}
           onDismiss={dismissSelection}
         />
@@ -1529,6 +1642,33 @@ export const AgentTranscript = memo(
   AgentTranscriptComponent,
   (previous, next) => previous.visible === false && next.visible === false,
 );
+
+/** Ask a read-only side question as of this turn, without touching the draft. */
+function SideQuestionButton({
+  open,
+  unavailable,
+}: {
+  open: () => void;
+  unavailable: () => string | undefined;
+}) {
+  // Follow session updates even while the pointer or focus stays on this button.
+  const reason = unavailable();
+  return (
+    <button
+      type="button"
+      title={reason ?? "Side question about this turn"}
+      aria-label="Side question about this turn"
+      aria-disabled={!!reason}
+      onClick={() => {
+        const blocked = unavailable();
+        if (!blocked) open();
+      }}
+      className={`rounded-md p-1 ${reason ? "cursor-default text-content/25" : "text-content/40 hover:bg-content/8 hover:text-content/70"}`}
+    >
+      <MessageSquare className="size-3.5" strokeWidth={1.75} />
+    </button>
+  );
+}
 
 /** "Today", "Yesterday" or the date, in bold, with the time beside it. */
 export function dayStamp(at: number, now = Date.now()): [string, string] {
@@ -1657,6 +1797,9 @@ function TurnDuration({
   fromModel,
   onSecondOpinion,
   onHandoff,
+  fork,
+  sideQuestion,
+  ended = false,
 }: {
   elapsedMs: number | null;
   label?: string;
@@ -1678,6 +1821,15 @@ function TurnDuration({
   fromModel?: string;
   onSecondOpinion?: (target: ModelTarget) => void;
   onHandoff?: (target: ModelTarget) => void;
+  fork?: {
+    turnLabel: string;
+    checkout: string;
+    menu: () => ForkMenu;
+    run: TurnFork["run"];
+  };
+  sideQuestion?: { open: () => void; unavailable: () => string | undefined };
+  /** Stopped or interrupted: no completion check. */
+  ended?: boolean;
 }) {
   const label =
     completionLabel ?? formatWorkingDuration(elapsedMs, modelName, true);
@@ -1701,7 +1853,7 @@ function TurnDuration({
               <SaveNoteButton text={output} onSave={onSaveNote} />
             ) : null}
           </>
-        ) : (
+        ) : ended ? null : (
           <Check className="size-3.5" strokeWidth={1.75} />
         )}
         {onShowWork ? (
@@ -1732,6 +1884,15 @@ function TurnDuration({
         {fromHarness && onHandoff ? (
           <HandoffButton from={fromHarness} onPick={onHandoff} />
         ) : null}
+        {fork ? (
+          <ForkButton
+            turnLabel={fork.turnLabel}
+            checkout={fork.checkout}
+            menu={fork.menu}
+            onFork={fork.run}
+          />
+        ) : null}
+        {sideQuestion ? <SideQuestionButton {...sideQuestion} /> : null}
         {fromHarness && onSecondOpinion ? (
           <SecondOpinionButton
             from={fromHarness}
@@ -2156,6 +2317,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
           harness={planHarness}
           model={planModel}
           modelSettings={planModelSettings}
+          inherited={block.inherited}
           onOpen={onOpenPlan ? () => onOpenPlan(block.id) : undefined}
           onBuild={
             onBuildPlan ? (target) => onBuildPlan(block.id, target) : undefined
@@ -2279,9 +2441,11 @@ function UserMessageBlock({
   const bubbleAttachments = photos.length
     ? block.attachments!.filter((file) => !photos.includes(file))
     : block.attachments;
+  const references = block.sessionReferences ?? [];
   const textOnly =
     Boolean(text) &&
     !block.draft &&
+    !references.length &&
     !bubbleAttachments?.length &&
     !card &&
     !note &&
@@ -2290,6 +2454,7 @@ function UserMessageBlock({
   const bubbleEmpty =
     photos.length > 0 &&
     !text &&
+    !references.length &&
     !bubbleAttachments?.length &&
     !card &&
     !note &&
@@ -2468,6 +2633,12 @@ function UserMessageBlock({
                     <AttachmentChip key={file.id} attachment={file} />
                   ))}
                 </div>
+              ) : null}
+              {references.length ? (
+                <SessionReferenceChips
+                  references={references}
+                  className={text || card || note ? "mb-2" : ""}
+                />
               ) : null}
               {note ? (
                 <div className={text || card ? "mb-2" : ""}>

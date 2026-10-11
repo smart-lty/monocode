@@ -16,6 +16,7 @@ use crate::fs::{
 };
 
 const MAX_SNAPSHOT_FILES: usize = 500;
+const NO_WORKER_BASELINE: &str = "This worker has no trusted initial checkpoint. Its files were kept. Automatic integration requires a saved pre-execution worker baseline or one complete recorded turn; legacy structured edits require their saved pre-edit snapshots. Review the retained checkout manually when these are unavailable.";
 
 mod turn;
 
@@ -215,10 +216,8 @@ impl CheckpointStore {
         session_id: &str,
         from_cwd: &str,
         to_cwd: &str,
+        files: Option<&[String]>,
     ) -> Result<CheckpointApplyResult, String> {
-        let manifest = self
-            .load_matching(session_id, from_cwd)?
-            .ok_or("This worker has no recoverable change checkpoint")?;
         let from_root = project_root(from_cwd)?;
         let to_root = project_root(to_cwd)?;
         if same_cwd(from_cwd, to_cwd) {
@@ -230,65 +229,77 @@ impl CheckpointStore {
                     .into(),
             );
         }
-        let dir = self.session_dir(session_id);
-        let changed = verified_worker_delta(&dir, &from_root, &manifest)?;
+        let delta = self.worker_delta(session_id, from_cwd)?;
+        let scopes = files
+            .map(|files| crate::control::control_scopes(to_cwd.to_string(), files.to_vec()))
+            .transpose()?;
 
         // Preflight every path before writing any of them. A retry may see a
         // mixture of before/after states if the app stopped during a previous
         // application; both are safe and make this operation idempotent.
         let mut already_applied = 0;
-        for relative in &changed {
+        for change in &delta.files {
+            let relative = &change.relative;
             if path_contains_symlink(&to_root, relative) {
                 return Err(format!(
                     "Cannot integrate {relative}: the target path contains a symbolic link. The worker worktree was kept."
                 ));
             }
-            let before = manifest
-                .files
-                .get(relative)
-                .copied()
-                .ok_or_else(|| format!("Missing original snapshot for {relative}"))?;
-            let after = manifest
-                .after
-                .get(relative)
-                .copied()
-                .ok_or_else(|| format!("Missing worker snapshot for {relative}"))?;
-            let target = worktree_snapshot(&to_root, relative);
-            let before_state = stored_snapshot(&dir, relative, before, false);
-            let after_state = stored_snapshot(&dir, relative, after, true);
-            if target == after_state {
+            if let Some(scopes) = &scopes {
+                let path =
+                    crate::control::control_scopes(to_cwd.to_string(), vec![relative.clone()])?
+                        .pop()
+                        .ok_or("Missing integration path")?;
+                if !scopes
+                    .iter()
+                    .any(|scope| Path::new(&path).starts_with(scope))
+                {
+                    return Err(format!(
+                        "Cannot integrate {relative}: it is outside this worker's assigned write scope. The worker worktree was kept."
+                    ));
+                }
+            }
+            let target = delta.target_state(&to_root, relative);
+            if target == change.after {
                 already_applied += 1;
-            } else if target != before_state {
+            } else if target != change.before {
                 return Err(format!(
                     "Cannot integrate {relative}: the lead checkout changed since this worker started. The worker worktree was kept."
                 ));
             }
         }
 
-        for relative in &changed {
-            let after = manifest.after.get(relative).copied().unwrap();
-            let target = worktree_snapshot(&to_root, relative);
-            let after_state = stored_snapshot(&dir, relative, after, true);
-            if target != after_state {
-                write_state(&to_root, relative, after_state.0, after_state.1)?;
+        if already_applied < delta.files.len() {
+            // An ordinary conversation may be running here. Its turn records
+            // the combined workspace, so it must not undo integrated work.
+            self.mark_active_turns_shared(&to_root, session_id)?;
+        }
+        for change in &delta.files {
+            let target = delta.target_state(&to_root, &change.relative);
+            if target != change.after {
+                write_state(
+                    &to_root,
+                    &change.relative,
+                    change.after.0.clone(),
+                    change.after.1,
+                )?;
             }
         }
         Ok(CheckpointApplyResult {
-            files: changed,
+            files: delta
+                .files
+                .into_iter()
+                .map(|change| change.relative)
+                .collect(),
             already_applied,
         })
     }
 
     fn cleanup_safe(&self, session_id: &str, cwd: &str) -> Result<bool, String> {
-        let Some(manifest) = self.load_matching(session_id, cwd)? else {
-            return Ok(false);
-        };
-        let root = project_root(cwd)?;
-        Ok(
-            verified_worker_delta(&self.session_dir(session_id), &root, &manifest)
-                .map(|changed| changed.is_empty())
-                .unwrap_or(false),
-        )
+        Ok(self
+            .worker_delta(session_id, cwd)
+            .map(|delta| delta.files.is_empty())
+            .unwrap_or(false))
     }
 
     fn forget(&self, session_id: &str) -> Result<(), String> {
@@ -495,6 +506,54 @@ impl CheckpointStore {
     }
 }
 
+struct WorkerChange {
+    relative: String,
+    before: (FileState, Option<u32>),
+    after: (FileState, Option<u32>),
+}
+
+struct WorkerDelta {
+    files: Vec<WorkerChange>,
+    git_modes: bool,
+}
+
+impl WorkerDelta {
+    fn target_state(&self, root: &Path, relative: &str) -> (FileState, Option<u32>) {
+        let (state, mode) = worktree_snapshot(root, relative);
+        let mode = if self.git_modes {
+            mode.map(|mode| if mode & 0o111 != 0 { 0o755 } else { 0o644 })
+        } else {
+            mode
+        };
+        (state, mode)
+    }
+}
+
+impl CheckpointStore {
+    fn worker_delta(&self, session: &str, cwd: &str) -> Result<WorkerDelta, String> {
+        if let Some(delta) = self.recorded_worker_delta(session, cwd)? {
+            return Ok(delta);
+        }
+        let root = project_root(cwd)?;
+        let manifest = self
+            .load_matching(session, cwd)?
+            .ok_or(NO_WORKER_BASELINE)?;
+        let dir = self.session_dir(session);
+        let files = verified_worker_delta(&dir, &root, &manifest)?
+            .into_iter()
+            .map(|relative| WorkerChange {
+                before: stored_snapshot(&dir, &relative, manifest.files[&relative], false),
+                after: stored_snapshot(&dir, &relative, manifest.after[&relative], true),
+                relative,
+            })
+            .collect();
+        Ok(WorkerDelta {
+            files,
+            git_modes: false,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {
@@ -598,12 +657,18 @@ pub async fn session_checkpoint_begin_turn(
     session_id: String,
     cwd: String,
     turn_id: String,
+    retire_worker: Option<bool>,
 ) -> Result<(), String> {
     validate_id(&session_id, "session")?;
     validate_id(&turn_id, "turn")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(|store| store.begin_turn(&session_id, &cwd, &turn_id))
+        store.exclusive(|store| {
+            if retire_worker == Some(true) {
+                store.retire_worker(&session_id, &cwd)?;
+            }
+            store.begin_turn(&session_id, &cwd, &turn_id)
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -614,13 +679,15 @@ pub async fn session_checkpoint_finish_turn(
     store: State<'_, CheckpointStore>,
     session_id: String,
     cwd: String,
-    turn_id: String,
+    turn_id: Option<String>,
 ) -> Result<(), String> {
     validate_id(&session_id, "session")?;
-    validate_id(&turn_id, "turn")?;
+    if let Some(id) = &turn_id {
+        validate_id(id, "turn")?;
+    }
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(|store| store.finish_turn(&session_id, &cwd, &turn_id))
+        store.exclusive(|store| store.finish_saved_turn(&session_id, &cwd, turn_id.as_deref()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -631,11 +698,15 @@ pub async fn session_checkpoint_ensure(
     store: State<'_, CheckpointStore>,
     session_id: String,
     cwd: String,
+    worker: Option<bool>,
 ) -> Result<(), String> {
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(|store| store.ensure(&session_id, &cwd))
+        store.exclusive(|store| match worker {
+            Some(fresh) => store.ensure_worker(&session_id, &cwd, fresh),
+            None => store.ensure(&session_id, &cwd),
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -700,11 +771,12 @@ pub async fn session_checkpoint_apply(
     session_id: String,
     from_cwd: String,
     to_cwd: String,
+    files: Option<Vec<String>>,
 ) -> Result<CheckpointApplyResult, String> {
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(|store| store.apply(&session_id, &from_cwd, &to_cwd))
+        store.exclusive(|store| store.apply(&session_id, &from_cwd, &to_cwd, files.as_deref()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2068,14 +2140,14 @@ mod tests {
         store.capture("worker", &from, &["a.txt".into()]).unwrap();
         assert!(!store.cleanup_safe("worker", &from).unwrap());
 
-        let applied = store.apply("worker", &from, &to).unwrap();
+        let applied = store.apply("worker", &from, &to, None).unwrap();
         assert_eq!(applied.files, ["a.txt"]);
         assert_eq!(applied.already_applied, 0);
         assert_eq!(
             std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
             "worker result\n"
         );
-        let retried = store.apply("worker", &from, &to).unwrap();
+        let retried = store.apply("worker", &from, &to, None).unwrap();
         assert_eq!(retried.already_applied, 1);
     }
 
@@ -2100,7 +2172,7 @@ mod tests {
         store.capture("worker", &from, &["a.txt".into()]).unwrap();
         std::fs::write(target.0.join("a.txt"), "lead changed\n").unwrap();
 
-        let conflict = store.apply("worker", &from, &to).unwrap_err();
+        let conflict = store.apply("worker", &from, &to, None).unwrap_err();
         assert!(conflict.contains("lead checkout changed"));
         assert_eq!(
             std::fs::read_to_string(source.0.join("a.txt")).unwrap(),
@@ -2114,7 +2186,7 @@ mod tests {
         std::fs::write(source.0.join("unreported.txt"), "unknown\n").unwrap();
         assert!(!store.cleanup_safe("worker", &from).unwrap());
         assert!(store
-            .apply("worker", &from, &to)
+            .apply("worker", &from, &to, None)
             .unwrap_err()
             .contains("not captured"));
     }

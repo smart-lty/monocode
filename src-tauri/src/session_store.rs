@@ -992,6 +992,32 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     crate::automations::ensure_tables(conn)?;
     ensure_orchestration_history(conn)?;
     crate::mono_transcript::ensure_tables(conn)?;
+    let count_missing: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'user_turn_count')",
+        [], |row| row.get(0),
+    )?;
+    ensure_session_column(conn, "user_turn_count", "INTEGER NOT NULL DEFAULT 0")?;
+    if current < 20 || count_missing {
+        let tx = conn.unchecked_transaction()?;
+        // Top-level blocks only: queues, drafts and internal app turns do not count.
+        tx.execute(
+            "UPDATE sessions SET user_turn_count = (SELECT count(*) FROM json_each(CASE WHEN json_valid(blocks_json) THEN blocks_json ELSE '[]' END)
+             WHERE json_extract(CASE WHEN type='object' THEN value ELSE '{}' END, '$.role') = 'user'
+               AND COALESCE(json_extract(CASE WHEN type='object' THEN value ELSE '{}' END, '$.draft'), 0) != 1
+               AND COALESCE(json_extract(CASE WHEN type='object' THEN value ELSE '{}' END, '$.internal'), 0) != 1)", [],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(20, ?1)",
+            [now_millis()],
+        )?;
+        tx.commit()?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS sessions_reference_project_idx ON sessions(cwd, updated_at DESC, id, title, harness, model, user_turn_count)
+         WHERE user_turn_count > 0 AND archived = 0 AND sidebar_hidden = 0 AND inbox_ask IS NULL;
+         CREATE INDEX IF NOT EXISTS sessions_reference_all_idx ON sessions(updated_at DESC, id, cwd, title, harness, model, user_turn_count)
+         WHERE user_turn_count > 0 AND archived = 0 AND sidebar_hidden = 0 AND inbox_ask IS NULL;",
+    )?;
     Ok(())
 }
 
@@ -1174,6 +1200,7 @@ pub(crate) fn upsert_session(
         .filter(|value| !value.is_empty());
 
     let has_user_message = has_user_block(&session.blocks);
+    let user_turn_count = sent_user_turn_count(&session.blocks);
     let is_draft = has_draft_block(&session.blocks);
 
     let existing: Option<(i64, i64, String, i64, i64, String)> = conn
@@ -1210,8 +1237,8 @@ pub(crate) fn upsert_session(
            provider_session_id, blocks_json, created_at, updated_at, branch,
            context_used, context_window, worktree_cwd, has_user_message,
            linked_work_item_json, provider_account_id, worktree_removed, is_draft,
-           automation_id, queued_messages_json, queue_status, sidebar_hidden
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+           automation_id, queued_messages_json, queue_status, sidebar_hidden, user_turn_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
          ON CONFLICT(id) DO UPDATE SET
            cwd = excluded.cwd,
            harness = excluded.harness,
@@ -1234,7 +1261,8 @@ pub(crate) fn upsert_session(
            automation_id = excluded.automation_id,
            queued_messages_json = excluded.queued_messages_json,
            queue_status = excluded.queue_status,
-           sidebar_hidden = excluded.sidebar_hidden",
+           sidebar_hidden = excluded.sidebar_hidden,
+           user_turn_count = excluded.user_turn_count",
         params![
             session.id,
             session.cwd,
@@ -1260,6 +1288,7 @@ pub(crate) fn upsert_session(
             queued_messages_json,
             session.queue_status,
             i64::from(session.sidebar_hidden),
+            user_turn_count,
         ],
     )?;
 
@@ -1737,6 +1766,19 @@ fn has_user_block(blocks: &Value) -> bool {
     })
 }
 
+fn sent_user_turn_count(blocks: &Value) -> i64 {
+    blocks.as_array().map_or(0, |blocks| {
+        blocks
+            .iter()
+            .filter(|block| {
+                block.get("role").and_then(Value::as_str) == Some("user")
+                    && block.get("draft").and_then(Value::as_bool) != Some(true)
+                    && block.get("internal").and_then(Value::as_bool) != Some(true)
+            })
+            .count() as i64
+    })
+}
+
 fn has_draft_block(blocks: &Value) -> bool {
     blocks.as_array().is_some_and(|blocks| {
         blocks.iter().any(|block| {
@@ -2189,6 +2231,75 @@ mod tests {
     }
 
     #[test]
+    fn reference_turn_count_migration_backfills_repairs_and_tracks_only_sent_users() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mut row = sample("counted", "/tmp/project", "Count");
+        row.blocks = json!([
+            {"id":"u1","role":"user","text":"sent"},
+            {"id":"draft","role":"user","text":"draft","draft":true},
+            {"id":"internal","role":"user","text":"internal","internal":true},
+            {"id":"tool","role":"tool","text":"nested","tool":{"role":"user"}},
+            {"id":"u2","role":"user","text":"sent again","draft":false,"internal":false}
+        ]);
+        row.queued_messages = vec![json!({"id":"q","text":"unsent"})];
+        upsert_session(&conn, &row).unwrap();
+        let before: (String, i64) = conn
+            .query_row(
+                "SELECT blocks_json,updated_at FROM sessions WHERE id='counted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_turn_count FROM sessions WHERE id='counted'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        // Simulate a recorded schema version whose column/index never landed.
+        conn.execute_batch("DROP INDEX sessions_reference_project_idx; DROP INDEX sessions_reference_all_idx; ALTER TABLE sessions DROP COLUMN user_turn_count;").unwrap();
+        migrate(&conn).unwrap();
+        let after: (String, i64, i64) = conn
+            .query_row(
+                "SELECT blocks_json,updated_at,user_turn_count FROM sessions WHERE id='counted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((after.0, after.1), before);
+        assert_eq!(after.2, 2);
+        migrate(&conn).unwrap();
+        row.blocks = json!([{"id":"draft","role":"user","text":"unsent","draft":true}]);
+        upsert_session(&conn, &row).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_turn_count FROM sessions WHERE id='counted'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        for (cwd, index) in [
+            ("cwd='/tmp/project' AND ", "sessions_reference_project_idx"),
+            ("", "sessions_reference_all_idx"),
+        ] {
+            let sql=format!("EXPLAIN QUERY PLAN SELECT id,cwd,title,harness,model,updated_at,user_turn_count FROM sessions WHERE {cwd}user_turn_count>0 AND archived=0 AND sidebar_hidden=0 AND inbox_ask IS NULL ORDER BY updated_at DESC,id ASC LIMIT 100");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let plans = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(plans.iter().any(|p| p.contains(index)), "{plans:?}");
+        }
+    }
+
+    #[test]
     fn legacy_inbox_chats_are_not_normal_sessions() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.lock_conn().unwrap();
@@ -2321,7 +2432,7 @@ mod tests {
                        ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
                                     model, runtime_mode, title, provider_session_id,
                                     created_at, branch, archived, pinned, linked_work_item_json);
-                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19);",
+                     DELETE FROM schema_migrations WHERE version >= 16;",
                 )
                 .unwrap();
                 migrate(&conn).unwrap();
@@ -2346,7 +2457,7 @@ mod tests {
                 .unwrap();
             assert!(
                 plan.contains("COVERING INDEX"),
-                "sidebar listing fell back to table seeks: {plan}"
+                "sidebar listing fell back to table seeks (upgraded={upgraded}): {plan}"
             );
         }
     }
@@ -2503,21 +2614,32 @@ mod tests {
     fn sidebar_visibility_migration_keeps_existing_sessions_visible() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.lock_conn().unwrap();
-        upsert_session(&conn, &sample("existing", "/tmp/a", "Existing")).unwrap();
+        let row = sample("existing", "/tmp/a", "Existing");
+        let before = upsert_session(&conn, &row).unwrap();
         conn.execute_batch(
             "DROP INDEX sessions_cwd_cover_idx;
+             DROP INDEX sessions_reference_project_idx;
+             DROP INDEX sessions_reference_all_idx;
              ALTER TABLE sessions DROP COLUMN sidebar_hidden;
-             DELETE FROM schema_migrations WHERE version = 19;",
+             ALTER TABLE sessions DROP COLUMN user_turn_count;
+             DELETE FROM schema_migrations WHERE version >= 19;",
         )
         .unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert!(!list_by_project(&conn, "/tmp/a").unwrap()[0].sidebar_hidden);
-        assert!(
-            !get_session(&conn, "existing")
-                .unwrap()
-                .unwrap()
-                .sidebar_hidden
+        let after = get_session(&conn, "existing").unwrap().unwrap();
+        assert!(!after.sidebar_hidden);
+        assert_eq!(after.blocks, row.blocks);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            conn.query_row(
+                "SELECT user_turn_count FROM sessions WHERE id='existing'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
     }
 

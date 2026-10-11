@@ -43,6 +43,7 @@ vi.mock("../model/orchestration", async (importOriginal) => ({
     resumeBlocker: vi.fn(() => undefined),
     resumeLeadBusy: vi.fn(() => false),
     start: vi.fn(async () => {}),
+    stopRun: vi.fn(async () => {}),
     cancelTask: vi.fn(async () => {}),
   },
 }));
@@ -854,7 +855,90 @@ describe("orchestration composer and card", () => {
     expect(openIds()).toEqual(["three"]);
   });
 
-  it("explains paused recovery and opens the conversation blocking Resume", async () => {
+  it.each(["active", "paused", "stopped", "finished"] as const)(
+    "offers Stop for an idle %s lead and Resume only when paused",
+    async (status) => {
+      emptyRuns.push({ version: 2, leadId: "lead", cwd: "/repo", status,
+        allowedHarnesses: ["codex"], maxWorkers: 1, cli: "monocode", tasks: [],
+        requests: {}, continuations: 0 });
+      await act(async () => root.render(createElement(OrchestrationSidebarAgents, {
+        leadId: "lead", summary: { status, live: true, tasks: [] },
+      })));
+      const stop = [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((element) => element.textContent?.trim() === "Stop orchestration");
+      expect(!!stop).toBe(status === "active" || status === "paused");
+      expect(container.textContent?.includes("Resume")).toBe(status === "paused");
+      if (stop) {
+        expect(stop.disabled).toBe(false);
+        await click(stop);
+        expect(orchestrator.stopRun).toHaveBeenCalledWith("lead");
+      }
+    },
+  );
+
+  it.each(["Resume", "Stop orchestration"])(
+    "%s handles pointer input without starting the parent session card drag or selecting it",
+    async (label) => {
+      emptyRuns.push({ version: 2, leadId: "lead", cwd: "/repo", status: "paused",
+        allowedHarnesses: ["codex"], maxWorkers: 1, cli: "monocode", tasks: [],
+        requests: {}, continuations: 0 });
+      const startDrag = vi.fn();
+      const selectSession = vi.fn();
+      await act(async () => root.render(createElement("div", {
+        onPointerDown: startDrag,
+        onClick: selectSession,
+      }, createElement(OrchestrationSidebarAgents, {
+        leadId: "lead", summary: { status: "paused", live: true, tasks: [] },
+      }))));
+      const control = button(label);
+      act(() => control.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true, pointerId: 1, button: 0,
+      })));
+      expect(startDrag).not.toHaveBeenCalled();
+      await click(control);
+      expect(selectSession).not.toHaveBeenCalled();
+      if (label === "Resume")
+        expect(orchestrator.start).toHaveBeenCalledExactlyOnceWith("lead", ["codex"], 1);
+      else
+        expect(orchestrator.stopRun).toHaveBeenCalledExactlyOnceWith("lead");
+    },
+  );
+
+  it("keeps Stop available after a failed stop, with no misleading Resume", async () => {
+    emptyRuns.push({ version: 2, leadId: "lead", cwd: "/repo", status: "stopped", stopPending: true,
+      allowedHarnesses: ["codex"], maxWorkers: 1, cli: "monocode", tasks: [], requests: {}, continuations: 0 });
+    await act(async () => root.render(createElement(OrchestrationSidebarAgents, {
+      leadId: "lead", summary: { status: "stopped", live: true, tasks: [] },
+    })));
+    expect(container.textContent).not.toContain("Resume");
+    await click(button("Stop orchestration"));
+    expect(orchestrator.stopRun).toHaveBeenCalledWith("lead");
+  });
+
+  it("labels terminal results and reviewed shared work accurately", async () => {
+    await act(async () => root.render(createElement(OrchestrationSidebarAgents, {
+      leadId: "lead", summary: { status: "stopped", live: true, tasks: [
+        { sessionId: "first", title: "Unaccepted", harness: "codex", model: "codex:two", status: "completed", accepted: false },
+        { sessionId: "second", title: "Shared", harness: "codex", model: "codex:two", status: "completed", accepted: true, workspacePolicy: "shared" },
+      ] },
+    })));
+    expect(container.querySelector('[data-orchestration-agent="first"]')?.textContent).toContain("Not integrated");
+    expect(container.querySelector('[data-orchestration-agent="second"]')?.textContent).toContain("Reviewed");
+    expect(container.textContent).not.toContain("Awaiting review");
+  });
+
+  it("distinguishes a completed result from an integrated result", async () => {
+    await act(async () => root.render(createElement(OrchestrationSidebarAgents, {
+      leadId: "lead", summary: { status: "active", live: true, tasks: [
+        { sessionId: "first", title: "Awaiting task", harness: "codex", model: "codex:two", status: "completed", accepted: false },
+        { sessionId: "second", title: "Integrated task", harness: "codex", model: "codex:two", status: "completed", accepted: true },
+      ] },
+    })));
+    expect(container.querySelector('[data-orchestration-agent="first"]')?.textContent).toContain("Awaiting review");
+    expect(container.querySelector('[data-orchestration-agent="second"]')?.textContent).toContain("Integrated");
+  });
+
+  it("explains paused recovery and opens another orchestrator blocking Resume", async () => {
     const task: OrchestrationTask = {
       id: "task",
       sessionId: "worker",

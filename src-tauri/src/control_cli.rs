@@ -12,12 +12,16 @@ Usage: {exe} control ACTION [--json JSON | --input FILE|-] [--request-id ID]
 Actions, with the JSON object each one takes:
   list      {}
             The run, every task with its status and latest result, and the
-            harness/model IDs you may assign.
+            harness/model IDs and their settings/options you may assign.
   delegate  {"title":"Short title","harness":"<id from list>",
              "model":"<id from list>","prompt":"Self-contained instructions",
+             "modelSettings":{"reasoningEffort":"<value from list>"},
              "files":["src/feature"],"dependsOn":["<taskId>"]}
             Queue a worker and return its taskId. "model" is optional and
             defaults to the first model list allows for that harness.
+            "modelSettings" is optional; use setting IDs and option values
+            from list (e.g. reasoningEffort for Codex, effort for Claude).
+            Unsupported settings are rejected, not silently downgraded.
             "files" is the write scope: project-relative paths, where a
             directory covers its descendants and ["."] reserves the whole
             checkout. "dependsOn" holds taskIds that must be reviewed first.
@@ -82,10 +86,12 @@ const ACTIONS: [&str; 12] = [
     "list", "delegate", "get", "steer", "message", "retry", "cancel", "wait", "review", "finish",
     "respond", "answer",
 ];
-const APP_ACTIONS: [&str; 32] = [
+const APP_ACTIONS: [&str; 34] = [
     "models.list",
     "sessions.list",
     "sessions.read",
+    "sessions.export",
+    "sessions.references",
     "sessions.send",
     "sessions.draft",
     "sessions.start",
@@ -116,7 +122,7 @@ const APP_ACTIONS: [&str; 32] = [
     "habits.remove",
     "chat.card",
 ];
-const APP_USAGE: &str = r#"MonoCode app access — use in a thread enabled by /operator.
+const APP_USAGE: &str = r#"MonoCode app access — Operator actions or sent-reference read access.
 
 Usage: {exe} app ACTION [--json JSON | --input FILE|-] [--request-id ID]
 
@@ -132,6 +138,24 @@ Actions:
                   reasoning are omitted. Omit before for the newest page;
                   pass nextBefore from a result for older exchanges. maxChars
                   caps each message (200-6000, default 1200).
+                  For LOSSLESS reads explicitly use view:"messages" or "blocks":
+                  {"sessionId":"...","view":"blocks","limit":10,"maxChars":4000}
+                  Includes all saved visible text (blocks includes tools/plans).
+                  Pass nextBefore as before for older pages, keeping the view.
+                  Long block: blockId=id, offset=nextOffset, same readVersion;
+                  repeat until nextOffset=null. Offsets are UTF-16 units.
+                  Version mismatch requires rereading offset=0/the first page.
+                  limit:1-30, maxChars:200-12000, maxTotalChars:200-20000.
+                  Compact result AND CLI wrapper/newline share 20000 UTF-16
+                  units / at most 60000 UTF-8 bytes. No text is silently dropped.
+  sessions.references {"limit":10,"cursor":"<nextCursor>"}
+                  Paginated directory derived only from sent user references.
+  sessions.export {"sessionId":"..."}
+                  Writes fixed transcript.json and manifest.json; stdout is
+                  a small manifest with absolute paths, revision and counts.
+                  Includes saved visible tools/plans and attachment metadata,
+                  not media bytes or hidden/unsaved native state. Later source
+                  changes never rewrite an export. Each call creates new files.
   sessions.send  {"sessionId":"...","prompt":"...","notifyOnComplete":true}
                   Submit a follow-up to an idle session in this project.
                   A busy session is rejected. Reuse --request-id on retries.
@@ -261,6 +285,8 @@ Actions:
                   the user must start it before it is scheduled.
 
 The output is one JSON line: {"ok":true,"result":...} or {"ok":false,"error":"..."}.
+Explicit sent references also enable sessions.read/export for those IDs only,
+including other projects. They grant no sending, mutation or orchestration.
 Use --input - to pass JSON on stdin. Never print MonoCode credentials.
 Keep the same --request-id when retrying a call after an uncertain result.
 "#;
@@ -332,7 +358,12 @@ fn run_mode(args: Vec<String>, app_mode: bool) -> i32 {
     match send(&action, &input, &request_id, app_mode) {
         Ok(mut value) => {
             if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                let value = bounded_app_output(value, &action, &input, app_mode);
+                let success = value.get("ok").and_then(Value::as_bool) == Some(true);
                 println!("{value}");
+                if !success {
+                    return 1;
+                }
                 return 0;
             }
             value = with_retry_hint(value, &request_id);
@@ -351,6 +382,24 @@ fn run_mode(args: Vec<String>, app_mode: bool) -> i32 {
             1
         }
     }
+}
+
+fn bounded_app_output(value: Value, action: &str, input: &Value, app_mode: bool) -> Value {
+    if app_mode
+        && (action == "sessions.references"
+            || (action == "sessions.read"
+                && input
+                    .get("view")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| ["messages", "blocks"].contains(&v))))
+    {
+        let output = value.to_string();
+        if output.encode_utf16().count() + 1 > 20_000 || output.len() + 1 > 60_000 {
+            return json!({"ok":false,"code":"SESSION_STDOUT_BUDGET_EXCEEDED","retryable":false,
+                "error":"Read result exceeded the complete stdout budget. Retry with a smaller maxTotalChars; no partial text was printed."});
+        }
+    }
+    value
 }
 
 fn with_retry_hint(mut value: Value, request_id: &str) -> Value {
@@ -582,6 +631,14 @@ mod tests {
     }
     #[test]
     fn explains_help_and_malformed_invocations() {
+        let (_, input, _) = call(&[
+            "delegate",
+            "--json",
+            r#"{"modelSettings":{"reasoningEffort":"max"}}"#,
+        ])
+        .unwrap();
+        assert_eq!(input["modelSettings"]["reasoningEffort"], "max");
+        assert!(USAGE.contains("modelSettings"));
         assert!(matches!(parse_args(&args(&[])), Ok(Parsed::Help)));
         assert!(matches!(parse_args(&args(&["--help"])), Ok(Parsed::Help)));
         // Agents commonly probe a subcommand for its own usage text.
@@ -724,5 +781,24 @@ mod tests {
         assert!(app_help().contains("only when the user asks"));
         assert!(app_help().contains("expectedHash"));
         assert!(app_help().contains("Habit runs and other sessions cannot change"));
+    }
+    #[test]
+    fn lossless_stdout_counts_wrapper_newline_unicode_and_json_escaping() {
+        let input = json!({"view":"blocks"});
+        let oversized = json!({"ok":true,"result":{"text":"中".repeat(20_000)}});
+        let denied = bounded_app_output(oversized, "sessions.read", &input, true);
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "SESSION_STDOUT_BUDGET_EXCEEDED");
+        let value = json!({"ok":true,"result":{"text":"中😀\"\\\n".repeat(1000)}});
+        let allowed = bounded_app_output(value.clone(), "sessions.read", &input, true);
+        assert_eq!(allowed, value);
+        // Leave one unit/byte for the stdout newline in both output budgets.
+        assert!(allowed.to_string().encode_utf16().count() < 20_000);
+        assert!(allowed.to_string().len() < 60_000);
+        let legacy = json!({"ok":true,"result":{"text":"x".repeat(30_000)}});
+        assert_eq!(
+            bounded_app_output(legacy.clone(), "sessions.read", &json!({}), true),
+            legacy
+        );
     }
 }

@@ -12,7 +12,7 @@ import {
 import type { Note } from "../../notes";
 import type { Artifact } from "../../artifacts/artifacts";
 import type { Worktree } from "../../source-control/model/worktrees";
-import { handleAgentApp, notePreview, canAccessAgentAppProject, type AgentAppHost } from "./agentApp";
+import { handleAgentApp, agentAppSourceAllowed, notePreview, canAccessAgentAppProject, type AgentAppHost } from "./agentApp";
 
 vi.mock("../../../integrations/harness/core/availability", () => ({
   isHarnessAvailable: (id: string) => id === "codex",
@@ -124,6 +124,96 @@ function fixture() {
 }
 
 describe("agent app commands", () => {
+  it.each(["stopped", "finished"])("allows normal reference reads after a historical %s run", async (status) => {
+    const { source, host } = fixture();
+    source.blocks = [{ id: "sent", role: "user", text: "read", sessionReferences: [{ sessionId: "other", title: "other", cwd: "/external", harness: "codex" }] }];
+    host.savedSession = vi.fn(async () => ({ id: "other", title: "other", cwd: "/external", harness: "codex", model: "codex:test", updatedAt: 1, readVersion: "v1", blocks: [{ id: "u", role: "user", text: "saved cross-project message" }] }));
+    // This is the exact predicate the App listener applies before dispatching.
+    expect(agentAppSourceAllowed(source, { status })).toBe(true);
+    const result = await handleAgentApp(source, "continued", "sessions.read", { sessionId: "other", view: "messages" }, host, "references") as { blocks: { text: string }[] };
+    expect(result.blocks[0].text).toBe("saved cross-project message");
+  });
+
+  it("keeps live/paused leads and every worker isolated even when their run is historical", () => {
+    const { source } = fixture();
+    expect(agentAppSourceAllowed(source)).toBe(true);
+    for (const status of ["active", "paused", "unknown"]) expect(agentAppSourceAllowed(source, { status })).toBe(false);
+    for (const status of ["active", "paused", "stopped", "finished"])
+      expect(agentAppSourceAllowed({ ...source, orchestrationLeadId: "lead" }, { status })).toBe(false);
+    expect(agentAppSourceAllowed(undefined)).toBe(false);
+    expect(agentAppSourceAllowed({ ...source, inboxAsk: { mode: "ask" } as never })).toBe(false);
+  });
+
+  it("reads every saved visible message and long tool text across explicit cross-project references", async () => {
+    const { source, host } = fixture();
+    source.blocks = [{ id: "ref", role: "user", text: "compare", sessionReferences: [{ sessionId: "external", title: "Other", cwd: "/other", harness: "codex" }] }];
+    const full = '中文😀"\\\n'.repeat(6000);
+    const saved = { id: "external", title: "Saved", cwd: "/other", updatedAt: 1, readVersion: "r1", blocks: [
+      { id: "user", role: "user" as const, text: "original" },
+      { id: "progress", role: "assistant" as const, text: "first reply" },
+      { id: "tool", role: "tool" as const, text: full, tool: { title: "exec", input: "input", detail: "detail" } },
+      { id: "plan", role: "plan" as const, text: "saved plan" },
+      { id: "answer", role: "assistant" as const, text: "second reply" },
+    ] };
+    host.savedSession = vi.fn(async () => saved);
+    const seen: string[] = [];
+    let before: string | null = null;
+    do {
+      const page = await handleAgentApp(source, "read", "sessions.read", { sessionId: saved.id, view: "messages", limit: 1, ...(before ? { before, readVersion: "r1" } : {}) }, host, "references") as { blocks: { id: string }[]; nextBefore: string | null };
+      seen.unshift(...page.blocks.map((b) => b.id)); before = page.nextBefore;
+    } while (before);
+    expect(seen).toEqual(["user", "progress", "answer"]);
+    let offset: number | null = 0, joined = "";
+    do {
+      const page = await handleAgentApp(source, "tool", "sessions.read", { sessionId: saved.id, view: "blocks", blockId: "tool", offset, readVersion: "r1", maxChars: 12000 }, host, "references") as { blocks: { text: string; nextOffset: number | null }[] };
+      expect(JSON.stringify({ ok: true, result: page }).length + 1).toBeLessThanOrEqual(20000);
+      joined += page.blocks[0].text; offset = page.blocks[0].nextOffset;
+    } while (offset !== null);
+    expect(joined).toBe(`exec\n\ninput\n\n${full}\n\ndetail`);
+    expect(host.session).not.toHaveBeenCalled();
+    saved.readVersion = "r2";
+    await expect(handleAgentApp(source, "changed", "sessions.read", { sessionId: saved.id, view: "blocks", blockId: "tool", offset: 1000, readVersion: "r1" }, host, "references")).rejects.toMatchObject({ code: "SESSION_READ_VERSION_MISMATCH", actualReadVersion: "r2" });
+  });
+
+  it("refuses draft/queued/internal references, unreferenced reads, and all mutations with read-only credentials", async () => {
+    const { source, host } = fixture();
+    const ref = { sessionId: "other", title: "Other", cwd: "/other", harness: "codex" as const };
+    source.blocks = [{ id: "draft", role: "user", text: "", draft: true, sessionReferences: [ref] }, { id: "internal", role: "user", text: "", internal: true, sessionReferences: [ref] }];
+    source.queuedMessages = [{ id: "queued", text: "later", attachments: [], sessionReferences: [ref] }];
+    await expect(handleAgentApp(source, "no", "sessions.read", { sessionId: "other", view: "messages" }, host, "references")).rejects.toThrow("sent user");
+    source.blocks.push({ id: "sent", role: "user", text: "compare", sessionReferences: [ref] });
+    for (const action of ["sessions.send", "sessions.draft", "sessions.stop", "sessions.archive", "sessions.delete", "sessions.start", "notes.write", "models.list"]) {
+      await expect(handleAgentApp(source, "mutate", action, {}, host, "references")).rejects.toThrow("reading only");
+    }
+    await expect(handleAgentApp(source, "no", "sessions.export", { sessionId: "unrelated" }, host, "references")).rejects.toThrow("sent user");
+    expect(host.send).not.toHaveBeenCalled();
+  });
+
+  it("paginates the full sent directory, including budget-overflow sources, and exports only a small manifest", async () => {
+    const { source, host } = fixture();
+    source.blocks = [{ id: "sent", role: "user", text: "compare", sessionReferences: Array.from({ length: 75 }, (_, i) => ({ sessionId: `ref-${i}`, title: "Reference", cwd: "/other", harness: "codex" })) }];
+    host.exportConversation = vi.fn(async (_source, id) => ({ schemaVersion: 1, sessionId: id, updatedAt: 1, readVersion: "r1", path: "/app/exports/transcript.json", manifestPath: "/app/exports/manifest.json", bytes: 1000000, sha256: "hash", blockCount: 100, attachmentCount: 2, fixed: true, scope: "saved visible", omissions: ["hidden/unsaved state"] }));
+    const ids: string[] = []; let cursor: string | null = null;
+    do {
+      const page = await handleAgentApp(source, "directory", "sessions.references", { limit: 10, ...(cursor ? { cursor } : {}) }, host, "references") as { items: { sessionId: string }[]; nextCursor: string | null };
+      ids.push(...page.items.map((item) => item.sessionId)); cursor = page.nextCursor;
+    } while (cursor);
+    expect(ids).toHaveLength(75); expect(new Set(ids).size).toBe(75);
+    const largeRefs = Array.from({ length: 5 }, (_, i) => ({ sessionId: `large-${i}`, title: "中".repeat(11000), cwd: "/other", harness: "codex" as const }));
+    const largeSource = { ...source, blocks: [{ id: "sent", role: "user" as const, text: "compare", sessionReferences: largeRefs }] };
+    let largeCursor: string | null = null; const largeIds: string[] = [];
+    do {
+      const page = await handleAgentApp(largeSource, "large-directory", "sessions.references", { limit: 30, ...(largeCursor ? { cursor: largeCursor } : {}) }, host, "references") as { items: { sessionId: string }[]; nextCursor: string | null };
+      expect(JSON.stringify({ ok: true, result: page }).length + 1).toBeLessThanOrEqual(20000);
+      largeIds.push(...page.items.map((item) => item.sessionId)); largeCursor = page.nextCursor;
+    } while (largeCursor);
+    expect(largeIds).toHaveLength(5);
+    const manifest = await handleAgentApp(source, "export", "sessions.export", { sessionId: "ref-74" }, host, "references");
+    expect(manifest).toMatchObject({ fixed: true, bytes: 1000000, blockCount: 100 });
+    expect(JSON.stringify(manifest).length).toBeLessThan(2000);
+    expect(host.exportConversation).toHaveBeenCalledWith(source.id, "ref-74");
+    await expect(handleAgentApp(source, "no-loss", "sessions.read", { sessionId: "ref-74", view: "messages" }, host, "references")).rejects.toThrow("Lossless");
+  });
   it.each([undefined, true, false])(
     "uses the Mono's sidebar preference for both submitted and draft sessions: %s",
     async (showStartedSessionsInSidebar) => {

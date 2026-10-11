@@ -4,13 +4,19 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionPane, type SessionPaneProps } from "./SessionPane";
 import { clearComposerDraft, setComposerDraft } from "../model/draftCache";
+import type { OrchestrationRun } from "../../orchestration/model/orchestration";
 
 const probes = vi.hoisted(() => ({
   pick: vi.fn(),
   transcript: vi.fn(),
-  runs: [],
+  runs: [] as OrchestrationRun[],
+  mono: true,
+  composer: vi.fn(),
 }));
-vi.mock("./Composer", () => ({ Composer: () => null }));
+vi.mock("./Composer", () => ({ Composer: (props: { onSubmit: (text: string, files: unknown[]) => void }) => {
+  probes.composer(props);
+  return createElement("button", { onClick: () => props.onSubmit("Independent turn", []) }, "Send ordinary turn");
+} }));
 vi.mock("../hooks/useFileDrop", () => ({ useFileDrop: () => false }));
 vi.mock("../model/attachments", async (original) => ({
   ...(await original<typeof import("../model/attachments")>()),
@@ -38,14 +44,14 @@ vi.mock("../../orchestration/model/orchestration", async (original) => ({
 }));
 vi.mock("../../monos/model/mono", async (original) => ({
   ...(await original<typeof import("../../monos/model/mono")>()),
-  monoForSession: () => ({
+  monoForSession: () => probes.mono ? ({
     id: "mono",
     sessionId: "chat",
     name: "Captain",
     mascot: "cat",
     color: "#6ba",
     projects: [],
-  }),
+  }) : null,
 }));
 let container: HTMLDivElement;
 let root: Root;
@@ -66,6 +72,9 @@ beforeEach(() => {
   vi.stubGlobal("cancelAnimationFrame", vi.fn());
   localStorage.clear();
   probes.transcript.mockClear();
+  probes.composer.mockClear();
+  probes.runs.length = 0;
+  probes.mono = true;
   clearComposerDraft("chat");
   probes.pick.mockReset().mockResolvedValue([
     {
@@ -145,6 +154,24 @@ function field() {
     '[aria-label="Message Captain"]',
   )!;
 }
+
+it.each(["active", "paused"] as const)("keeps an independent session in a %s lead checkout unmanaged and sendable", (status) => {
+  probes.mono = false;
+  probes.runs.push({ version: 2, leadId: "lead", cwd: "/repo", status,
+    allowedHarnesses: ["codex"], maxWorkers: 1, cli: "monocode", tasks: [],
+    requests: {}, continuations: 0 });
+  const pane = props();
+  pane.session = { ...pane.session, blocks: [] };
+  pane.onSubmit = vi.fn();
+  render(pane);
+  expect(probes.composer.mock.calls.at(-1)![0]).toMatchObject({ hideBranchPicker: false, draftWorkspace: true });
+  act(() => [...container.querySelectorAll<HTMLButtonElement>("button")]
+    .find((button) => button.textContent === "Send ordinary turn")!.click());
+  expect(pane.onSubmit).toHaveBeenCalledWith("chat", "Independent turn", [], undefined);
+  probes.runs = [{ ...probes.runs[0], leadId: "chat" }];
+  render({ ...pane, session: { ...pane.session } });
+  expect(probes.composer.mock.calls.at(-1)![0].hideBranchPicker).toBe(true);
+});
 
 it("keeps the same input, current draft and attachments when a question appears and closes", async () => {
   setComposerDraft("chat", "Initial draft");

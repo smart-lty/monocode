@@ -104,6 +104,8 @@ type Live = {
   cancelled: boolean;
   muteUpdates: boolean;
   activeTurnId: string | null;
+  /** Finished native turns cannot publish late snapshots into a later turn. */
+  finishedTurnIds: Set<string>;
   turns: Promise<void>;
   /** Resolves when the current turn completes (or is cancelled). */
   turnDone: (() => void) | null;
@@ -433,7 +435,8 @@ export async function cancelCodexTurn(sessionId: string): Promise<void> {
   finishActiveTurn(live, [
     { type: "message.completed" },
     { type: "reasoning.completed" },
-  ]);
+    { type: "turn.cancelled", ...(turnId ? { providerTurnId: turnId } : {}) },
+  ], "cancelled");
 }
 
 export async function stopCodexSession(sessionId: string): Promise<void> {
@@ -773,6 +776,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       cancelled: false,
       muteUpdates: didResume,
       activeTurnId: null,
+      finishedTurnIds: new Set(),
       turns: Promise.resolve(),
       turnDone: null,
       turnFailed: null,
@@ -855,9 +859,21 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
     const turnId = response.turn?.id ?? live.activeTurnId;
     // turn/completed can arrive before turn/start returns; don't resurrect a
     // finished turn's id after finishActiveTurn cleared activeTurnId.
-    if (turnId && live.turnDone) {
+    if (turnId && live.turnDone && !live.cancelled) {
       live.activeTurnId = live.activeTurnId ?? turnId;
       live.onEvent({ type: "turn.started", providerTurnId: turnId });
+    } else if (turnId) {
+      // Stop may finish before this reply exposes an id. The next turn is
+      // serialized after this reply, so record it before that turn unmutes.
+      const needsInterrupt = live.cancelled && live.activeTurnId !== turnId &&
+        !live.finishedTurnIds.has(turnId);
+      live.finishedTurnIds.add(turnId);
+      if (needsInterrupt) {
+        await live.rpc.request("turn/interrupt", {
+          threadId: live.threadId,
+          turnId,
+        }).catch(() => undefined);
+      }
     }
     settlePendingTurn(live);
     await turnPromise;
@@ -867,6 +883,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
       type: "session.error",
       message: error instanceof Error ? error.message : String(error),
     });
+    finishActiveTurn(live, [], "failed");
     throw error;
   } finally {
     live.turnDone = null;
@@ -895,6 +912,11 @@ async function runCompaction(live: Live): Promise<void> {
     live.turnDone = null;
     live.turnFailed = null;
   }
+}
+
+function isStaleNativeTurn(live: Live, turnId: string | undefined): boolean {
+  return !!turnId && (live.finishedTurnIds.has(turnId) ||
+    (!!live.activeTurnId && turnId !== live.activeTurnId));
 }
 
 function handleNotification(
@@ -932,11 +954,22 @@ function handleNotification(
   if (threadId && threadId !== live.threadId) {
     return handleSubagentNotification(live, threadId, method, params);
   }
+  const nativeTurnId = stringField(rec, "turnId") ?? stringField(asRecord(rec?.turn), "id");
+  if (isStaleNativeTurn(live, nativeTurnId)) return;
+  const generation = live.turnGeneration;
   // A Codex turn is a sequence of items. Completing an agentMessage does not
   // mean the turn is over — more tools and messages can still arrive. Only
   // turn/completed (and turn/aborted) settle sendCodexTurn, which is what the
   // UI uses for busy / stop / "Working for".
   const mapped = mapCodexNotification(method, params);
+  // An abort can precede the turn/start reply. Bind its id before publishing
+  // cancellation so the state layer can reject an abort from an older turn.
+  if (mapped.turnCompleted && nativeTurnId && !live.activeTurnId) {
+    live.activeTurnId = nativeTurnId;
+    if (mapped.turnCompleted.status === "interrupted" || mapped.turnCompleted.status === "cancelled") {
+      live.onEvent({ type: "turn.started", providerTurnId: nativeTurnId });
+    }
+  }
   if (mapped.diagnostic) {
     console.debug(
       `[monocode] codex ${live.threadId} ${method}`,
@@ -1005,10 +1038,11 @@ function handleNotification(
     }
   }
   const finish = () => {
+    if (live.turnGeneration !== generation || live.muteUpdates || live.cancelled) return;
     settleSubagentRows(live, rec);
     if (mapped.rateLimits) noteRateLimits(live, mapped.rateLimits);
     if (mapped.usageLimited) live.usageLimited = true;
-    if (mapped.activeTurnId !== undefined) {
+    if (mapped.activeTurnId !== undefined && !mapped.turnCompleted) {
       live.activeTurnId = mapped.activeTurnId;
     }
     if (mapped.turnCompleted) {
@@ -1021,11 +1055,12 @@ function handleNotification(
         });
       }
       live.usageLimited = false;
-      finishActiveTurn(live);
+      finishActiveTurn(live, [], mapped.turnCompleted.status === "failed" ? "failed"
+        : mapped.turnCompleted.status === "completed" ? "completed" : "cancelled");
     }
   };
   const afterImages = () => {
-    if (live.muteUpdates || live.cancelled) return;
+    if (live.turnGeneration !== generation || live.muteUpdates || live.cancelled) return;
     if (replay) return replay.then(finish);
     finish();
   };
@@ -1312,14 +1347,14 @@ function settleSubagentRows(
  * A turn cannot end with an agent still working. Codex does not always report
  * a closing state for every child, and a row left running would hop forever.
  */
-function closeOpenAgentRows(live: Live): void {
+function closeOpenAgentRows(live: Live, status: "completed" | "failed" | "cancelled"): void {
   for (const [callId, title] of live.openAgentRows) {
     live.onEvent({
       type: "tool.updated",
       callId,
       title,
       kind: "agent",
-      status: "completed",
+      status,
     });
   }
   live.openAgentRows.clear();
@@ -1351,11 +1386,16 @@ function publishCodexText(
   live.onEvent({ type: "reasoning.delta", text: emit });
 }
 
-function finishActiveTurn(live: Live, extraEvents: HarnessEvent[] = []): void {
+function finishActiveTurn(
+  live: Live,
+  extraEvents: HarnessEvent[] = [],
+  status: "completed" | "failed" | "cancelled" = "completed",
+): void {
   clearServerRequests(live);
-  closeOpenAgentRows(live);
+  closeOpenAgentRows(live, status);
   live.turnEndPending = false;
   live.turnGeneration += 1;
+  if (live.activeTurnId) live.finishedTurnIds.add(live.activeTurnId);
   live.activeTurnId = null;
   live.emittedAssistantByItem.clear();
   live.emittedReasoningByItem.clear();
@@ -1391,8 +1431,10 @@ async function handleServerRequest(
   params: unknown,
 ): Promise<void> {
   const threadId = stringField(asRecord(params), "threadId") ?? live.threadId;
+  const stale = threadId === live.threadId &&
+    isStaleNativeTurn(live, stringField(asRecord(params), "turnId"));
   if (method === "item/tool/requestUserInput") {
-    if (live.cancelled || live.muteUpdates) {
+    if (live.cancelled || live.muteUpdates || stale) {
       await live.rpc.respond(id, { answers: {} });
       return;
     }
@@ -1448,8 +1490,8 @@ async function handleServerRequest(
 
   if (method === "mcpServer/elicitation/request") {
     const confirmation = codexMcpConfirmation(params);
-    if (!confirmation || live.cancelled || live.muteUpdates) {
-      if (!live.cancelled && !live.muteUpdates)
+    if (!confirmation || live.cancelled || live.muteUpdates || stale) {
+      if (!live.cancelled && !live.muteUpdates && !stale)
         live.onEvent({
           type: "status",
           text: "This MCP server requested a form or browser sign-in that MonoCode does not support yet. Complete it in the server's own interface.",
@@ -1504,7 +1546,7 @@ async function handleServerRequest(
     return;
   }
 
-  if (live.planning || live.cancelled || live.muteUpdates) {
+  if (live.planning || live.cancelled || live.muteUpdates || stale) {
     // Plan turns run in a non-escalating read-only sandbox. If an older
     // app-server still asks for broader access, deny it silently instead of
     // leaking a Supervised approval prompt into the user's selected mode.

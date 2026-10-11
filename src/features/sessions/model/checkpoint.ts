@@ -78,9 +78,10 @@ export function subscribeReviewChanged(
 export function ensureSessionCheckpoint(
   sessionId: string,
   cwd: string,
+  options?: { worker: boolean },
 ): Promise<void> {
   return enqueueCheckpoint(sessionId, () =>
-    invoke<void>("session_checkpoint_ensure", { sessionId, cwd }),
+    invoke<void>("session_checkpoint_ensure", { sessionId, cwd, ...options }),
   );
 }
 
@@ -88,18 +89,22 @@ export function ensureSessionCheckpoint(
 export async function beginSessionTurn(
   sessionId: string,
   cwd: string,
+  options?: { required: boolean; retireWorker?: boolean },
 ): Promise<string | undefined> {
   if (!cwd || cwd === "~") return undefined;
   const id = crypto.randomUUID();
   activeTurns.set(sessionId, { id, cwd });
   // Capture errors are also persisted by the backend and shown in the review.
-  await enqueueCheckpoint(sessionId, () =>
+  const begun = enqueueCheckpoint(sessionId, () =>
     invoke<void>("session_checkpoint_begin_turn", {
       sessionId,
       cwd,
       turnId: id,
+      ...(options?.retireWorker ? { retireWorker: true } : {}),
     }),
-  ).catch(console.error);
+  );
+  if (options?.required) await begun;
+  else await begun.catch(console.error);
   notifyReviewChanged(sessionId);
   return id;
 }
@@ -108,21 +113,26 @@ export async function beginSessionTurn(
 export function finishSessionTurn(
   sessionId: string,
   cwd: string,
-  options?: { turnId?: string; after?: Promise<unknown> },
+  options?: {
+    turnId?: string;
+    after?: Promise<unknown>;
+    recover?: boolean;
+    required?: boolean;
+  },
 ): Promise<void> {
   const active = activeTurns.get(sessionId);
   const id = options?.turnId ?? (active?.cwd === cwd ? active.id : undefined);
-  if (!id) return Promise.resolve();
-  return enqueueCheckpoint(sessionId, async () => {
+  if (!id && !options?.recover) return Promise.resolve();
+  const finished = enqueueCheckpoint(sessionId, async () => {
     // Cancellation must stop the provider before its final snapshot is taken.
     await options?.after;
     await invoke<void>("session_checkpoint_finish_turn", {
       sessionId,
       cwd,
-      turnId: id,
+      turnId: id ?? null,
     });
-  })
-    .catch(console.error)
+  });
+  return (options?.required ? finished : finished.catch(console.error))
     .finally(() => {
       if (activeTurns.get(sessionId)?.id === id) activeTurns.delete(sessionId);
       notifyReviewChanged(sessionId);
@@ -177,12 +187,14 @@ export function applySessionCheckpoint(
   sessionId: string,
   fromCwd: string,
   toCwd: string,
+  files?: string[],
 ): Promise<CheckpointApplyResult> {
   return enqueueCheckpoint(sessionId, () =>
     invoke<CheckpointApplyResult>("session_checkpoint_apply", {
       sessionId,
       fromCwd,
       toCwd,
+      ...(files ? { files } : {}),
     }),
   );
 }

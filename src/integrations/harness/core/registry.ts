@@ -18,6 +18,8 @@ import type {
   RewindLastTurnResult,
   SendTurnInput,
   SteerTurnInput,
+  ForkSessionInput,
+  ForkSessionResult,
 } from "./types";
 
 export type TitleInput = {
@@ -37,7 +39,14 @@ export type TextPromptInput = {
   ephemeral?: boolean;
   codexStore?: "mono";
   threadId?: string;
+  /** Sent only after the provider confirms a native resume. */
+  resumePrompt?: string;
   onThreadId?: (threadId: string) => void;
+  onQueueState?: (state: "queued" | "running") => void;
+  /** Cancellation cleanup failed or could not confirm the native turn stopped. */
+  onCancelError?: (error: Error) => void;
+  /** Read-only, bounded host tool. The runner has no send/write handler. */
+  readContext?: (request: import("../../../features/agent-app/model/btwContext").BtwReadRequest) => Promise<unknown>;
   intent?: TurnIntent;
   prompt: string;
   timeoutMs?: number;
@@ -61,6 +70,7 @@ export type HarnessAdapter = {
   compactContext?(input: CompactContextInput): Promise<void>;
   /** Rewind provider state so the last user turn can be replaced. */
   rewindLastTurn?(input: RewindLastTurnInput): Promise<RewindLastTurnResult>;
+  forkSession?(input: ForkSessionInput): Promise<ForkSessionResult>;
   steerTurn(input: SteerTurnInput): Promise<void>;
   cancelTurn(sessionId: string): Promise<void>;
   respondApproval(
@@ -221,26 +231,59 @@ export function sendHarnessTurn(input: SendTurnInput & { harness: HarnessId }) {
     }
     cancelIdlePark(input.sessionId);
     const controlled = typeof isTauri === "function" && isTauri();
-    if (controlled)
-      await invoke("control_authorize_turn", {
+    const referenceTurnId = controlled
+      ? await invoke<string>("control_authorize_turn", {
         sessionId: input.sessionId,
         cwd: input.cwd,
         appAccess: input.appAccess === true,
-      });
+        ...(input.sessionReferenceAuthorizationPending ? { referencesPending: true } : {}),
+      }) : undefined;
     activeTurnSessions.add(input.sessionId);
+    let acceptance: Promise<void> | undefined;
+    let failedAcceptanceStop: Promise<void> | undefined;
     try {
       await adapter.sendTurn({
         ...input,
+        // Reuse the existing loopback transport; the control service still
+        // checks reference-only actions and source IDs independently.
+        controlsAgents: input.controlsAgents || input.sessionReferenceAccess,
         onAccepted: () => {
+          if (acceptance) return;
           input.onEvent({ type: "turn.ready" });
-          input.onAccepted?.();
+          // Invoke synchronously so App commits its accepted user block before
+          // later events, then keep the scoped CLI closed through the durable save.
+          try {
+            const saved = input.onAccepted?.();
+            acceptance = Promise.resolve(saved).then(async () => {
+              if (controlled && input.sessionReferenceAuthorizationPending) {
+                const refreshed = await invoke<boolean>("control_refresh_references", {
+                  sessionId: input.sessionId, turnId: referenceTurnId,
+                });
+                if (!refreshed) throw new Error("The reference turn ended before its accepted message was saved");
+              }
+            });
+          } catch (error) {
+            acceptance = Promise.reject(error);
+          }
+          // A failed save leaves the CLI closed and stops this provider turn.
+          void acceptance.catch(() => {
+            if (input.sessionReferenceAuthorizationPending && activeTurnSessions.has(input.sessionId))
+              failedAcceptanceStop = adapter.cancelTurn(input.sessionId).catch(() => undefined);
+          });
         },
       });
     } finally {
-      activeTurnSessions.delete(input.sessionId);
-      if (controlled)
-        await invoke("control_turn_finished", { sessionId: input.sessionId });
-      scheduleIdlePark(input.harness, input.sessionId);
+      try {
+        // Also wait when the provider finishes immediately after acceptance:
+        // a subsequent queued turn cannot race an older acceptance save.
+        await acceptance;
+      } finally {
+        await failedAcceptanceStop;
+        activeTurnSessions.delete(input.sessionId);
+        if (controlled)
+          await invoke("control_turn_finished", { sessionId: input.sessionId });
+        scheduleIdlePark(input.harness, input.sessionId);
+      }
     }
   });
 }
@@ -383,7 +426,7 @@ export function bindHarnessSession(
   adapter?.bindSession(threadId, providerSessionId, cwd, providerAccountId);
   if (!blocks || !adapter?.restoreTaskLists) return;
   const lists = blocks.flatMap((block) =>
-    block.role === "tasks" && block.taskList ? [block.taskList] : [],
+    block.role === "tasks" && block.taskList && !block.inherited ? [block.taskList] : [],
   );
   if (lists.length > 0) adapter.restoreTaskLists(threadId, lists);
 }
@@ -466,6 +509,12 @@ export async function warmupHarnessText(
 export function canRunHarnessTextPrompt(harness: HarnessId): boolean {
   const adapter = getHarness(harness);
   return adapter?.live === true && adapter.runTextPrompt != null;
+}
+
+export async function forkHarnessSession(harness: HarnessId, input: ForkSessionInput): Promise<ForkSessionResult> {
+  const adapter = requireHarness(harness);
+  if (!adapter.forkSession) throw new Error(`${harness} does not support exact native Fork. Choose visible history or Handoff explicitly.`);
+  return queueSessionOperation(input.sessionId, () => adapter.forkSession!(input));
 }
 
 function stopTextPrompt(adapter: HarnessAdapter): Promise<void> {

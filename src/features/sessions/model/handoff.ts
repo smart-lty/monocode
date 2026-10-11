@@ -156,7 +156,7 @@ export function lastHandoffBlock(blocks: Block[]): Block | undefined {
 export function isPreparingHandoff(session: Session): boolean {
   return session.blocks.some(
     (block) =>
-      block.role === "handoff" && block.handoff?.status === "preparing",
+      !block.inherited && block.role === "handoff" && block.handoff?.status === "preparing",
   );
 }
 
@@ -166,7 +166,7 @@ export function pendingHandoff(session: Session): {
   text: string;
 } | null {
   const last = lastHandoffBlock(session.blocks);
-  if (!last?.handoff?.pending || last.handoff.status !== "ready") return null;
+  if (last?.inherited || !last?.handoff?.pending || last.handoff.status !== "ready") return null;
   const text = last.text.trim() || buildDeterministicHandoff(session);
   if (!text.trim()) return null;
   return { from: last.handoff.from, to: last.handoff.to, text };

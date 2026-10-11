@@ -39,7 +39,7 @@ function setup() {
     session: (id) => sessions.find((session) => session.id === id),
     sessions: () => sessions,
     choices: () => [
-      { harness: "codex", models: [{ id: "codex:test", name: "Test" }] },
+      { harness: "codex", models: [{ id: "codex:test", name: "Test", settings: [{ id: "reasoningEffort", label: "Reasoning", kind: "select", value: "high", options: [{ value: "high", label: "High" }, { value: "max", label: "Max" }] }] }] },
     ],
     createWorker: vi.fn(async (run, task) => {
       sessions.push({
@@ -219,7 +219,7 @@ describe("local orchestration", () => {
     const f = setup();
     f.lead.busy = false;
     const card = proposal();
-    card.tasks[1].modelSettings = { reasoningEffort: "xhigh" };
+    card.tasks[1].modelSettings = { reasoningEffort: "max" };
     expect(f.host.submit).not.toHaveBeenCalled();
     await f.manager.startApproved("lead", "card", card);
     await vi.waitFor(() =>
@@ -229,12 +229,12 @@ describe("local orchestration", () => {
     expect(f.tasks()[0].prompt).toBe("User edited instructions");
     expect(f.tasks()[0].dependsOn).toEqual([f.tasks()[1].id]);
     expect(f.tasks()[1].modelSettings).toEqual({
-      reasoningEffort: "xhigh",
+      reasoningEffort: "max",
     });
     expect(f.host.createWorker).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        modelSettings: { reasoningEffort: "xhigh" },
+        modelSettings: { reasoningEffort: "max" },
       }),
     );
     expect(f.manager.run("lead")?.proposalId).toBe("card");
@@ -252,9 +252,9 @@ describe("local orchestration", () => {
     ).toContain("do not delegate duplicates");
     expect(
       vi.mocked(f.host.submit).mock.calls.find(([id]) => id === "lead")?.[1],
-    ).toContain('"modelSettings":{"reasoningEffort":"xhigh"}');
+    ).toContain('"modelSettings":{"reasoningEffort":"max"}');
   });
-  it("names the conversation that blocks a paused run from resuming", async () => {
+  it("resumes alongside an ordinary conversation in the same checkout", async () => {
     const f = setup();
     f.lead.busy = false;
     await f.manager.startApproved("lead", "card", proposal());
@@ -282,10 +282,11 @@ describe("local orchestration", () => {
       busy: true,
     });
 
-    expect(f.manager.resumeBlocker("lead")?.id).toBe("investigation");
-    await expect(f.manager.start("lead", ["codex"], 2)).rejects.toThrow(
-      '"Investigating the failure" is still running in this checkout. Stop it before resuming orchestration.',
-    );
+    expect(f.manager.resumeBlocker("lead")).toBeUndefined();
+    await f.manager.start("lead", ["codex"], 2);
+    expect(f.manager.run("lead")?.status).toBe("active");
+    expect(f.sessions.find((session) => session.id === "investigation")?.busy).toBe(true);
+    expect(f.host.stop).not.toHaveBeenCalledWith("investigation");
   });
   it("checks the new checkout rather than a stopped run's old checkout", async () => {
     const f = setup();
@@ -539,12 +540,13 @@ describe("local orchestration", () => {
     vi.mocked(f.host.cleanupWorker).mockResolvedValue(false);
 
     await f.call("cancel", { taskId: task.id });
-    const result = await f.call("finish");
+    const result = await f.call("finish", {}, "finish-result");
 
     expect(result).toEqual({
       finished: true,
       cleanupPending: [`/worktrees/${task.id}`],
     });
+    expect(f.store.disable).toHaveBeenCalledWith("lead", "finish-result");
     expect(f.tasks()[0].workspace?.checkoutCwd).toBe(`/worktrees/${task.id}`);
     expect(f.host.cleanupWorker).toHaveBeenCalledWith(
       expect.anything(),
@@ -1429,7 +1431,7 @@ describe("local orchestration", () => {
       f.call("steer", { taskId: task.id, text: "Too late" }),
     ).rejects.toThrow(/Only a running agent can be steered.*message/s);
   });
-  it("blocks ordinary sessions while a run owns their checkout", async () => {
+  it("allows ordinary sessions while a run owns their checkout", async () => {
     const f = setup();
     await f.start();
     f.sessions.push({
@@ -1437,7 +1439,220 @@ describe("local orchestration", () => {
       id: "other",
       busy: false,
     });
-    expect(f.manager.submissionError("other")).toContain("active orchestrator");
+    expect(f.manager.submissionError("other")).toBeNull();
     expect(f.manager.submissionError("lead")).toBeNull();
+  });
+  it("starts with an ordinary turn already running and stops neither conversation for the other", async () => {
+    const f = setup();
+    const ordinary = { ...newSession("codex", "/repo"), id: "ordinary", busy: true };
+    f.sessions.push(ordinary);
+    await f.start();
+    expect(ordinary.busy).toBe(true);
+    expect(f.manager.submissionError("ordinary")).toBeNull();
+    expect(f.manager.stopForSession("ordinary")).toBeNull();
+    expect(f.manager.run("lead")?.status).toBe("active");
+    await f.manager.stopRun("lead");
+    expect(ordinary.busy).toBe(true);
+    expect(f.host.stop).not.toHaveBeenCalledWith("ordinary");
+    expect(f.store.disable).toHaveBeenCalledWith("lead");
+  });
+  it("reserves one orchestrator and retains worker ownership while paused", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("running"));
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const worker = f.tasks()[0];
+    expect(f.manager.submissionError(worker.sessionId)).toContain("managed");
+    const second = { ...newSession("codex", "/repo"), id: "second", busy: false };
+    f.sessions.push(second);
+    await expect(f.manager.start("second", ["codex"], 2)).rejects.toThrow("already has an orchestrator");
+    f.saved.set("lead", { ...f.manager.run("lead")!, status: "paused" });
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    await restored.hydrate("lead");
+    expect(restored.submissionError(worker.sessionId)).toContain("managed");
+    expect(restored.submissionError("second")).toBeNull();
+    await expect(restored.start("second", ["codex"], 2)).rejects.toThrow("already has an orchestrator");
+  });
+  it("keeps an explicitly stopped run terminal even when saving history fails", async () => {
+    const f = setup();
+    await f.start();
+    const ordinary = { ...newSession("codex", "/repo"), id: "ordinary", busy: true };
+    f.sessions.push(ordinary);
+    f.store.save.mockRejectedValue(new Error("History unavailable"));
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")?.status).toBe("stopped");
+    expect(f.manager.run("lead")?.error).toContain("could not save history");
+    expect(f.store.disable).toHaveBeenCalledWith("lead");
+    expect(ordinary.busy).toBe(true);
+    expect(f.host.stop).not.toHaveBeenCalledWith("ordinary");
+  });
+  it("awaits the same hydrate operation and supplies worker identity before committing the run", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.tasks()[0].workspace).toBeDefined());
+    const task = f.tasks()[0];
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    let release!: () => void;
+    f.store.load.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return f.saved.get("lead")!;
+    });
+    vi.mocked(f.host.stop).mockClear();
+    const first = restored.hydrate("lead");
+    const second = restored.hydrate("lead");
+    expect(second).toBe(first);
+    expect(restored.run("lead")).toBeUndefined();
+    release();
+    await Promise.all([first, second]);
+    expect(f.host.stop).toHaveBeenCalledWith("lead");
+    expect(f.host.stop).toHaveBeenCalledWith(task.sessionId, { cwd: task.workspace!.checkoutCwd });
+    expect(restored.run("lead")?.status).toBe("paused");
+    const loads = f.store.load.mock.calls.length;
+    await restored.hydrate("lead");
+    expect(f.store.load).toHaveBeenCalledTimes(loads);
+  });
+  it.each(["stopped", "finished"] as const)("restores %s as a terminal state and revokes its idle connection", async (status) => {
+    const f = setup();
+    await f.start();
+    f.saved.set("lead", { ...f.manager.run("lead")!, status });
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    vi.mocked(f.host.stop).mockClear();
+    await restored.hydrate("lead");
+    restored.sync();
+    expect(restored.run("lead")?.status).toBe(status);
+    expect(f.store.disable).toHaveBeenCalledWith("lead");
+    expect(f.host.stop).not.toHaveBeenCalled();
+    expect(f.host.submit).not.toHaveBeenCalled();
+  });
+  it("does not accept an unrecoverable result and makes repeat review idempotent", async () => {
+    const f = setup();
+    await f.start();
+    await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    f.completions.get(task.sessionId)!({ status: "completed", text: "Result files retained" });
+    await vi.waitFor(() => expect(f.tasks()[0].status).toBe("completed"));
+    vi.mocked(f.host.integrateWorker).mockRejectedValueOnce(new Error("No trusted initial checkpoint; files kept"));
+    await expect(f.call("review", { taskId: task.id })).rejects.toThrow("trusted initial");
+    expect(f.tasks()[0].accepted).toBe(false);
+    expect(f.tasks()[0].workspace).toBeDefined();
+    expect(f.host.cleanupWorker).not.toHaveBeenCalled();
+    await f.call("review", { taskId: task.id });
+    await f.call("review", { taskId: task.id });
+    expect(f.host.integrateWorker).toHaveBeenCalledTimes(2);
+    expect(f.tasks()[0].accepted).toBe(true);
+  });
+});
+
+
+describe("delegate model settings", () => {
+  it("exposes valid options and persists explicit effort through dispatch and reload", async () => {
+    const f = setup();
+    await f.start();
+    const catalog = await f.call("list") as { harnesses: ReturnType<OrchestrationHost["choices"]> };
+    expect(catalog.harnesses[0].models[0].settings?.[0].options).toContainEqual({ value: "max", label: "Max" });
+    await f.delegate(["src"], { modelSettings: { reasoningEffort: "max" } });
+    const task = f.tasks()[0];
+    expect(task.modelSettings).toEqual({ reasoningEffort: "max" });
+    expect(f.saved.get("lead")?.tasks[0].modelSettings).toEqual(task.modelSettings);
+    await vi.waitFor(() => expect(f.host.createWorker).toHaveBeenCalled());
+    expect(vi.mocked(f.host.createWorker).mock.calls[0][1].modelSettings).toEqual(task.modelSettings);
+    expect(await f.call("get", { taskId: task.id })).toMatchObject({ modelSettings: task.modelSettings });
+    const restored = new Orchestrator(f.store);
+    restored.bind(f.host);
+    await restored.hydrate("lead");
+    expect(restored.run("lead")?.tasks[0].modelSettings).toEqual(task.modelSettings);
+  });
+
+  it.each([null, [], { reasoningEffort: 3 }, { reasoningEffort: "typo" }, { effort: "max" }])(
+    "rejects invalid settings %j before creating a worker",
+    async (modelSettings) => {
+      const f = setup();
+      await f.start();
+      await expect(f.delegate(["src"], { modelSettings })).rejects.toThrow();
+      expect(f.tasks()).toHaveLength(0);
+      expect(f.host.createWorker).not.toHaveBeenCalled();
+    },
+  );
+});
+
+
+describe("review regressions", () => {
+  it("settles a stopped worker even when its checkpoint failed, preserving its checkout", async () => {
+    const f = setup();
+    await f.start(); await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    vi.mocked(f.host.stop).mockImplementation(async (id) => id === task.sessionId ? { checkpointError: "Disk full" } : undefined);
+    await f.manager.stopRun("lead");
+    expect(f.tasks()[0]).toMatchObject({ status: "cancelled", activeDispatchId: undefined });
+    expect(f.tasks()[0].error).toContain("Disk full");
+    expect(f.host.cleanupWorker).not.toHaveBeenCalled();
+    expect(f.manager.submissionError(task.sessionId)).toBeNull();
+    expect(f.saved.get("lead")?.error).not.toContain("Resume");
+  });
+
+  it("keeps failed provider stops retryable without pretending the worker has stopped", async () => {
+    const f = setup();
+    await f.start(); await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    const task = f.tasks()[0];
+    vi.mocked(f.host.stop).mockImplementation(async (id) => { if (id === task.sessionId) throw new Error("Process still alive"); });
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")).toMatchObject({ status: "stopped", stopPending: true });
+    expect(f.tasks()[0].status).toBe("cancelling");
+    expect(f.host.cleanupWorker).not.toHaveBeenCalled();
+    expect(f.manager.submissionError(task.sessionId)).not.toBeNull();
+    vi.mocked(f.host.stop).mockResolvedValue(undefined);
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")).toMatchObject({ status: "stopped", stopPending: false });
+    expect(f.tasks()[0].status).toBe("cancelled");
+    expect(f.manager.submissionError(task.sessionId)).toBeNull();
+  });
+
+  it("retains Stop for a failed lead stop even with no workers", async () => {
+    const f = setup(); await f.start();
+    vi.mocked(f.host.stop).mockRejectedValueOnce(new Error("Lead still alive"));
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")).toMatchObject({ status: "stopped", stopPending: true });
+    expect(f.manager.submissionError("lead")).toContain("Retry Stop");
+    f.lead.busy = false;
+    await expect(f.manager.start("lead", ["codex"], 1)).rejects.toThrow("Retry Stop");
+  });
+
+  it("removes misleading Resume instructions after Stop with failed persistence", async () => {
+    const f = setup(); await f.start(); await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    f.store.save.mockRejectedValue(new Error("Disk full"));
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")?.status).toBe("stopped");
+    expect(f.tasks()[0].status).toBe("cancelled");
+    expect(f.tasks()[0].error).not.toContain("Resume");
+    expect(f.tasks()[0].recoveryPrompt).toBeUndefined();
+  });
+
+  it("settles stopped tasks and retains retry when control revocation fails", async () => {
+    const f = setup(); await f.start(); await f.delegate(["src"]);
+    await vi.waitFor(() => expect(f.host.submit).toHaveBeenCalledOnce());
+    f.store.disable.mockRejectedValueOnce(new Error("Transport unavailable"));
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")).toMatchObject({ status: "stopped", stopPending: true });
+    expect(f.tasks()[0].status).toBe("cancelled");
+    await f.manager.stopRun("lead");
+    expect(f.manager.run("lead")?.stopPending).toBe(false);
+  });
+
+  it("does not kill or revoke another window's run when recovery is denied", async () => {
+    const f = setup();
+    f.store.load.mockRejectedValue(new Error("This orchestration is running in another window"));
+    await expect(f.manager.hydrate("lead")).rejects.toThrow("another window");
+    expect(f.host.stop).not.toHaveBeenCalled();
+    expect(f.store.disable).not.toHaveBeenCalled();
+    expect(f.store.save).not.toHaveBeenCalled();
   });
 });

@@ -43,6 +43,7 @@ mod reminders;
 mod remote;
 mod remote_ssh;
 mod search;
+mod session_references;
 mod session_store;
 mod skills;
 pub mod ssh_askpass;
@@ -296,6 +297,7 @@ pub fn run() {
             control::control_authorize_turn,
             control::control_turn_finished,
             control::app_cli_path,
+            control::control_refresh_references,
             default_cwd,
             home_dir,
             fonts::list_font_families,
@@ -482,6 +484,9 @@ pub fn run() {
             pty::pty_kill_all,
             session_store::session_upsert,
             session_store::session_list_by_project,
+            session_references::session_reference_candidates,
+            session_references::session_reference_snapshot,
+            session_references::session_reference_export,
             session_store::session_rebase_project,
             session_store::session_list_linked,
             session_store::session_search,

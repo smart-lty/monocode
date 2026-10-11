@@ -1,4 +1,5 @@
 import { dropContextWindow, type ContextUsage } from "./contextUsage";
+import type { SessionReference } from "./sessionReferences";
 import type { UserQuestionPrompt } from "./userQuestion";
 import type { HandoffComposerCard } from "./handoff";
 import type { InboxComposerCard } from "../../inbox/model/githubTasks";
@@ -87,6 +88,8 @@ export type EditedResendRejection = {
   providerRewound: boolean;
 };
 export type ComposerTurnOptions = {
+  /** Explicit background sources; authority begins on the sent user block. */
+  sessionReferences?: SessionReference[];
   intent?: TurnIntent;
   resendEdited?: boolean;
   /** Restore an edited prompt when the resend rejects asynchronously. */
@@ -136,7 +139,37 @@ export type BtwMessage = {
   blocks?: Block[];
 };
 
-export type BtwThreadStatus = "running" | "ready" | "error";
+export type BtwThreadStatus = "queued" | "running" | "ready" | "error" | "cancelled";
+
+/** The user block identifies an application turn; IDs belong to this binding. */
+export type NativeTurnContext = {
+  harness: "codex" | "opencode";
+  sessionId: string;
+  turnId?: string;
+  userMessageId?: string;
+  messageIds?: string[];
+  source: "provider" | "fork";
+};
+
+/** Stored on the first inherited user block, without another session entity. */
+export type SessionForkOrigin = {
+  sourceSessionId: string;
+  sourceUserBlockId: string;
+  sourceEndBlockId: string;
+  sourceProviderSessionId?: string;
+  sourceNativeId?: string;
+  strategy: "native" | "visible-history" | "handoff";
+  cutoff: "completed-turn-inclusive";
+  nativeCutoff?: "inclusive-turn" | "exclusive-message";
+  requestId: string;
+  createdAt: number;
+  /** Maps the copied application blocks back to their source, including the end. */
+  blocks: { sourceId: string; childId: string }[];
+  warnings: string[];
+  coverage?: { visibleBlocks: number; chars: number; complete: boolean; omitted: string[] };
+  /** Only on an explicit failure record; never a resumable binding. */
+  recovery?: { unboundNativeSessionId: string; reason: string };
+};
 
 /** Independent, read-only "by the way" conversation anchored to a turn. */
 export type BtwThread = {
@@ -154,6 +187,10 @@ export type BtwThread = {
   modelSettings?: Record<string, string>;
   /** Provider-specific side-thread id when the text runner supports resume. */
   providerThreadId?: string;
+  /** Scope information shown by BtwSheet; parent history is fixed at the end ID. */
+  contextScope?: string;
+  /** The side model can supplement these sent sources through a read-only tool. */
+  readSources?: import("./sessionReferences").SessionReference[];
   error?: string;
   /** Live harness blocks for the in-flight reply; not persisted. */
   pendingBlocks?: Block[];
@@ -275,6 +312,7 @@ export type QueuedMessage = {
   blockId?: string;
   text: string;
   attachments: Attachment[];
+  sessionReferences?: SessionReference[];
   noteCard?: NoteComposerCard;
   handoffCard?: HandoffComposerCard;
   intent?: TurnIntent;
@@ -317,11 +355,14 @@ export type Block = {
   text: string;
   image?: GeneratedImageMeta;
   attachments?: Attachment[];
+  sessionReferences?: SessionReference[];
   streaming?: boolean;
   /** Epoch ms when this user turn started. */
   startedAt?: number;
   /** How long the agent worked on this user turn, in ms. */
   durationMs?: number;
+  /** An interrupted turn has a duration, but is not a completed boundary. */
+  turnOutcome?: "cancelled" | "error";
   /** Epoch ms when this message joined a turn that was already running. */
   sentAt?: number;
   /**
@@ -381,6 +422,10 @@ export type Block = {
   secondOpinion?: SecondOpinionMeta;
   /** Independent read-only side conversations anchored to this user turn. */
   btwThreads?: BtwThread[];
+  nativeContext?: NativeTurnContext;
+  forkOrigin?: SessionForkOrigin;
+  /** Display the original history, but never reuse its approvals/Build controls. */
+  inherited?: boolean;
   noteCard?: NoteCardMeta;
   /** Saved artifacts attached to this turn; their bodies live outside chat. */
   artifactCards?: import("../../artifacts/artifacts").ArtifactCard[];

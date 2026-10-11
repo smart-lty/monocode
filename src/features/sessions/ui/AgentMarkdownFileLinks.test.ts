@@ -197,4 +197,20 @@ describe("markdown file navigation", () => {
     ]);
     expect(onOpenFile).not.toHaveBeenCalled();
   });
+
+  it("preserves file navigation beside generics and Chinese emphasis", async () => {
+    await render(
+      "返回 Vec<String>，参见**（源码）** [文件](<docs/中文 Guide.md#L7>)。",
+    );
+    expect(container.textContent).toContain("返回 Vec<String>");
+    expect(
+      container.querySelector('[data-streamdown="strong"]')?.textContent,
+    ).toBe("（源码）");
+    await act(async () =>
+      container.querySelector<HTMLAnchorElement>("a")!.click(),
+    );
+    expect(onOpenFile).toHaveBeenCalledWith("/repo/docs/中文 Guide.md", {
+      line: 7,
+    });
+  });
 });

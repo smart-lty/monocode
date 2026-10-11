@@ -12,11 +12,7 @@ import {
 } from "react";
 import { Composer } from "./Composer";
 import type { Worktree } from "../../source-control/model/worktrees";
-import {
-  orchestrationCheckoutCwd,
-  orchestrator,
-  sameCheckout,
-} from "../../orchestration/model/orchestration";
+import { orchestrator } from "../../orchestration/model/orchestration";
 import { DiscussionEmpty } from "./DiscussionEmpty";
 import { LinkedWorkItemUpdateNotice } from "../../inbox/ui/LinkedWorkItemUpdateNotice";
 import { SessionReview } from "./SessionReview";
@@ -45,7 +41,11 @@ import {
   type WorkspaceMode,
   type ComposerTurnOptions,
 } from "../model/session";
-import { sessionHasBtwThreads, supportsBtwHarness } from "../model/btw";
+import { sessionHasBtwThreads, supportsBtwHarness, BTW_RETURN_EVENT, btwReturnDraftText, type BtwReturnRequest } from "../model/btw";
+import { requestSessionFork } from "../model/sessionFork";
+import { forkMenu, turnLabel } from "./forkChoices";
+import type { TurnFork } from "./ForkButton";
+import { sessionTitleFor } from "./sessionTitleLookup";
 import { BtwSheet, useBtwConversation } from "./BtwSheet";
 import { AgentTranscript } from "./AgentTranscript";
 import { PooledTranscript, type TranscriptPool } from "./TranscriptPool";
@@ -90,14 +90,16 @@ import {
   loadNotesEnabled,
   subscribeNotesEnabled,
 } from "../../settings/model/settings";
-import { getComposerDraft, setComposerDraft } from "../model/draftCache";
+import { getComposerDraft, setComposerDraft, getComposerSessionReferences, setComposerSessionReferences } from "../model/draftCache";
+import { sanitizeSessionReferences, type SessionReference } from "../model/sessionReferences";
+import { listSessionReferenceCandidates } from "../data/sessionStore";
 import { resolveModel } from "../model/models";
 import { isAstraModel } from "../model/astraWelcome";
 import { isOpus55Model } from "../model/opusWelcome";
 import { AstraWelcome } from "./AstraWelcome";
 import { OpusWelcome } from "./OpusWelcome";
 import { projectKey } from "../../../shared/lib/paths";
-import { canEditLastTurn, lastTurnRecall } from "../model/editLastTurn";
+import { canEditLastTurn, lastTurnRecall, lastUserTurnBlock } from "../model/editLastTurn";
 import {
   loadProjectChatBackgroundSettings,
   projectChatBackgroundImageRevision,
@@ -171,6 +173,8 @@ export type SessionPaneProps = {
     sessionId: string,
     text: string,
     attachments: Attachment[],
+    appRequestId?: string,
+    sessionReferences?: SessionReference[],
   ) => boolean | void;
   onRemoveDraft: (sessionId: string, draftBlockId: string) => boolean | void;
   onStop: (sessionId: string) => void;
@@ -366,7 +370,8 @@ const LocalSessionPane = memo(function LocalSessionPane({
   const managed = orchestrationRuns.some(
     (run) =>
       (run.status === "active" || run.status === "paused") &&
-      sameCheckout(orchestrationCheckoutCwd(run), sessionWorkCwd(session)),
+      (run.leadId === session.id ||
+        run.tasks.some((task) => task.sessionId === session.id)),
   );
   const title = sessionDisplayTitle(session.title, session.harness);
   const isEmpty = session.blocks.length === 0;
@@ -376,11 +381,27 @@ const LocalSessionPane = memo(function LocalSessionPane({
   );
   const recallLastTurnRef = useRef<(() => void) | null>(null);
   const remote = remoteSession;
+  // A fork whose native child could not be cleaned up is kept for manual
+  // recovery only: it has no binding, so it never sends or resumes.
+  const unboundFork = session.blocks.some((block) => block.forkOrigin?.recovery);
   // A Mono's chat is a running conversation; what was said stays said.
   const editLastTurnSupported =
-    !remote && !monoForSession(session.id) && canEditLastTurn(session);
+    !remote &&
+    !monoForSession(session.id) &&
+    canEditLastTurn(session) &&
+    !lastUserTurnBlock(session.blocks)?.inherited;
   const turnRecall = editLastTurnSupported ? lastTurnRecall(session) : null;
   const draftBlock = sessionDraftBlock(session);
+  const [composerReferenceDraft, setComposerReferenceDraft] = useState(() => ({
+    sessionId: session.id, references: getComposerSessionReferences(session.id),
+  }));
+  const composerReferences = composerReferenceDraft.sessionId === session.id
+    ? composerReferenceDraft.references : getComposerSessionReferences(session.id);
+  const changeComposerReferences = useCallback((references: SessionReference[]) => {
+    const clean = sanitizeSessionReferences(references).filter((ref) => ref.sessionId !== session.id);
+    setComposerSessionReferences(session.id, clean);
+    setComposerReferenceDraft({ sessionId: session.id, references: clean });
+  }, [session.id]);
   useSyncExternalStore(
     subscribeProjectChatBackground,
     projectChatBackgroundRevision,
@@ -437,9 +458,11 @@ const LocalSessionPane = memo(function LocalSessionPane({
     [onOpenPlan, session.id],
   );
   const buildPlan = useCallback(
-    (blockId: string, target?: PlanBuildTarget) =>
-      onBuildPlan(session.id, blockId, target),
-    [onBuildPlan, session.id],
+    (blockId: string, target?: PlanBuildTarget) => {
+      if (session.blocks.find((block) => block.id === blockId)?.inherited) return;
+      onBuildPlan(session.id, blockId, target);
+    },
+    [onBuildPlan, session.id, session.blocks],
   );
   const jumpToBottomRef = useRef<(() => void) | null>(null);
   const transcriptScope = useRef<HTMLDivElement>(null);
@@ -464,12 +487,28 @@ const LocalSessionPane = memo(function LocalSessionPane({
   useEffect(() => {
     if (!visible) setModelWelcome(null);
   }, [visible]);
-  // Restore a saved run for this lead; its agents render on the sidebar card.
-  useEffect(() => {
-    if (!remote && !session.inboxAsk && !session.worktreeRemoved)
-      void orchestrator.hydrate(session.id).catch(console.error);
-  }, [remote, session.id, session.inboxAsk, session.worktreeRemoved]);
   const [quoteRequest, setQuoteRequest] = useState<QuoteRequest>();
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const request = (event as CustomEvent<BtwReturnRequest>).detail;
+      if (request?.sessionId !== session.id || !visible) return;
+      try {
+        // Validates the message identity; the draft names the source readably.
+        btwReturnDraftText(session, request);
+        const thread = session.blocks
+          .flatMap((block) => block.btwThreads ?? [])
+          .find((entry) => entry.id === request.threadId)!;
+        const question = thread.messages.find((message) => message.role === "user")?.text.replace(/\s+/g, " ").trim() ?? "";
+        const turn = turnLabel(session.blocks, thread.sourceEndBlockId);
+        const text = `From side question “${question.length > 60 ? `${question.slice(0, 57)}…` : question}” (as of ${turn?.label ?? "an earlier turn"}, inclusive):\n${request.text.trim()}`;
+        quoteRequestId.current += 1;
+        setQuoteRequest({ id: quoteRequestId.current, mode: "plain", text });
+      }
+      catch { /* Reject a stale selection; UI keeps the existing composer draft. */ }
+    };
+    window.addEventListener(BTW_RETURN_EVENT, receive);
+    return () => window.removeEventListener(BTW_RETURN_EVENT, receive);
+  }, [session.id, session.blocks, visible]);
   const btw = useBtwConversation({
     available:
       !remote &&
@@ -477,10 +516,13 @@ const LocalSessionPane = memo(function LocalSessionPane({
       !managed &&
       !session.inboxAsk &&
       !session.worktreeRemoved &&
+      !unboundFork &&
       !!onBtwSubmit &&
       !!onBtwRetry &&
       (supportsBtwHarness(session.harness) ||
         sessionHasBtwThreads(session.blocks)),
+    sessionId: session.id,
+    busy: !!session.busy,
     blocks: session.blocks,
     harness: session.harness,
     managed,
@@ -614,6 +656,39 @@ const LocalSessionPane = memo(function LocalSessionPane({
     return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
   }, [addSelectionToChat, addToChatTarget]);
   const workCwd = sessionWorkCwd(session);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  // Live leads, workers and remote sessions are refused by the fork itself;
+  // the menu shows that reason. These never offer it at all.
+  const forkable =
+    !remote &&
+    !agent &&
+    !session.inboxAsk &&
+    !session.worktreeRemoved &&
+    !session.orchestrationLeadId &&
+    !unboundFork;
+  const fork = useMemo<TurnFork | undefined>(
+    () =>
+      forkable
+        ? {
+            checkout: workCwd,
+            menu: (userBlockId) => forkMenu(sessionRef.current, userBlockId),
+            run: (strategy, endBlockId) => requestSessionFork(session.id, endBlockId, strategy),
+          }
+        : undefined,
+    [forkable, workCwd, session.id],
+  );
+  // A source that is not loaded keeps the name the fork was created with.
+  const forkSourceTitle = useCallback(
+    (id: string) =>
+      sessionTitleFor(id) ??
+      (session.title?.startsWith("Fork · ") ? session.title.slice("Fork · ".length) : undefined),
+    [session.title],
+  );
+  const sideQuestion = useMemo(
+    () => (btw.available ? { open: btw.openAt, unavailable: btw.unavailableAt } : undefined),
+    [btw.available, btw.openAt, btw.unavailableAt],
+  );
   const showDeckProjectPicker = isEmpty && !looksLikeProject(session.cwd);
   // The agent's input always sits at the bottom, like a chat.
   const dockComposer =
@@ -624,7 +699,8 @@ const LocalSessionPane = memo(function LocalSessionPane({
   const composer = (
     <Composer
       key={session.id}
-      disabled={workspaceSwitchingSessionId === session.id}
+      disabled={workspaceSwitchingSessionId === session.id || unboundFork}
+      placeholder={unboundFork ? "This fork record has no provider binding. Nothing can be sent from it." : undefined}
       remoteSession={remoteSession}
       remoteFeatures={remoteFeatures}
       allowedModelHarnesses={allowedModelHarnesses}
@@ -719,8 +795,11 @@ const LocalSessionPane = memo(function LocalSessionPane({
         !session.noteCard &&
         !session.handoffCard
       }
-      onSaveDraft={(text, attachments) =>
-        onSaveDraft(session.id, text, attachments)
+      sessionReferences={composerReferences}
+      onSearchSessionReferences={remote || managed || session.orchestrationLeadId || session.inboxAsk || mono ? undefined : listSessionReferenceCandidates}
+      onSessionReferencesChange={changeComposerReferences}
+      onSaveDraft={(text, attachments, references) =>
+        references?.length ? onSaveDraft(session.id, text, attachments, undefined, references) : onSaveDraft(session.id, text, attachments)
       }
       onSubmit={(text, attachments, options) => {
         if (!dockComposer) composerDockMotion.captureLaunch();
@@ -981,6 +1060,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
                               block.attachments ?? [],
                               {
                                 draftBlockId: block.id,
+                                sessionReferences: block.sessionReferences,
                                 ...(block.appRequestId
                                   ? { appRequestId: block.appRequestId }
                                   : {}),
@@ -1020,6 +1100,9 @@ const LocalSessionPane = memo(function LocalSessionPane({
                         ? (target, turn) => onHandoff(session.id, target, turn)
                         : undefined
                     }
+                    fork={fork}
+                    sideQuestion={sideQuestion}
+                    sessionTitle={forkSourceTitle}
                     onJumpToBottomChange={jumpVisibility.setVisible}
                     onJumpToBottomReady={onJumpToBottomReady}
                     onRevealReady={onRevealReady}

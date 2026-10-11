@@ -2,6 +2,34 @@ import { describe, expect, it } from "vitest";
 import { parseStreamingMarkdown } from "./streamingMarkdown";
 
 describe("streaming Markdown blocks", () => {
+  it("retains completed comparison text while still repairing prose", () => {
+    expect(parseStreamingMarkdown("如果 a<b 则交换。")).toEqual([
+      "如果 a<b 则交换。",
+    ]);
+    expect(
+      parseStreamingMarkdown("范围 20~25 之间，或 30~40").join(""),
+    ).toContain("\\~");
+    expect(parseStreamingMarkdown("- > 25").join("")).toContain("\\>");
+  });
+
+  it("only hides an unfinished HTML tag in the last streaming block", () => {
+    const text = "前文 a<b 则交换。\n\n末尾 <details";
+    const streaming = parseStreamingMarkdown(text, { streaming: true });
+    expect(streaming[0]).toContain("a<b 则交换。");
+    expect(streaming.at(-1)).toBe("末尾");
+    expect(parseStreamingMarkdown(text, { streaming: false }).at(-1)).toBe(
+      "末尾 <details",
+    );
+  });
+
+  it("restores the same source when streaming completes", () => {
+    const text = "如果 a<b 则交换。";
+    expect(parseStreamingMarkdown(text, { streaming: true })).toEqual([
+      text,
+    ]);
+    expect(parseStreamingMarkdown(text, { streaming: false })).toEqual([text]);
+  });
+
   it("closes incomplete emphasis within its paragraph", () => {
     const blocks = parseStreamingMarkdown(
       "First **unfinished\n\nSecond paragraph.",

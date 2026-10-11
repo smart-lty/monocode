@@ -1,4 +1,4 @@
-import { TurnNotReadyError } from "../../core/types";
+import { TurnNotReadyError, UnboundForkError } from "../../core/types";
 import {
   modelContextWindow,
   nativeModelId,
@@ -72,6 +72,8 @@ import type {
   RewindLastTurnResult,
   SendTurnInput,
   SteerTurnInput,
+  ForkSessionInput,
+  ForkSessionResult,
 } from "../../core/types";
 import {
   questionPromptTitle,
@@ -864,6 +866,10 @@ async function handleEvent(
       const hidden = agent != null && KNOWN_HIDDEN_AGENTS.has(agent);
       if (id && (role === "user" || role === "assistant")) {
         live.messageRoleById.set(id, hidden ? "hidden" : role);
+        if (live.activeTurn && !hidden) live.onEvent({ type: "turn.nativeContext", context: {
+          harness: "opencode", sessionId: live.openCodeSessionId, source: "provider",
+          ...(role === "user" ? { userMessageId: id } : {}), messageIds: [id],
+        } });
       }
       // A compaction assistant's usage describes the summarization call, not
       // the rebuilt context. Keep the previous meter value until a real turn
@@ -1050,6 +1056,87 @@ async function handleEvent(
     default:
       break;
   }
+}
+
+/** Separate transport; the source's permission, binding and cancellation stay intact. */
+export async function forkOpenCodeSession(input: ForkSessionInput): Promise<ForkSessionResult> {
+  const temporaryId = `${input.sessionId}-fork`;
+  const transport = await ensureLive({ ...input, sessionId: temporaryId, runtimeMode: "supervised", onEvent: () => undefined });
+  let childId: string | undefined;
+  let verified = false;
+  try {
+    if (transport.client.generation !== "v1")
+      throw new Error("OpenCode v2 exact cutoff is unverified; choose visible-history reconstruction or Handoff.");
+    const source = await transport.client.getMessages(input.sourceProviderSessionId);
+    const prefix = openCodeForkPrefix(source, input);
+    const cutoff = stringField(asRecord(source[prefix.length]?.info), "id");
+    const child = await transport.client.forkSession(input.sourceProviderSessionId, input.cwd, cutoff);
+    childId = child.id;
+    if (!childId || childId === input.sourceProviderSessionId) throw new Error("OpenCode Fork did not return an independent child.");
+    const copied = await transport.client.getMessages(childId);
+    if (copied.length !== prefix.length || copied.some((message, index) =>
+      JSON.stringify(openCodeHistoryContent(message)) !== JSON.stringify(openCodeHistoryContent(prefix[index]))))
+      throw new Error("OpenCode native child exceeds or differs from the exclusive cutoff; the child was not bound.");
+    // Fork must not carry the parent's previously granted permission rules.
+    await transport.client.updateSession(childId, { permission: buildOpenCodePermissionRules(input.runtimeMode) });
+    let index = 0;
+    const nativeTurns = input.nativeTurns.map((turn) => {
+      const messages = copied.slice(index, index + turn.messageIds!.length);
+      index += messages.length;
+      const messageIds = messages.map((message) => stringField(asRecord(message.info), "id")!);
+      return { harness: "opencode" as const, sessionId: childId!, userMessageId: messageIds[0], messageIds, source: "fork" as const };
+    });
+    verified = true;
+    return { providerSessionId: childId, nativeCutoff: "exclusive-message", nativeTurns,
+      discard: () => discardOpenCodeFork(input, childId!) };
+  } finally {
+    let cleanupError: UnboundForkError | undefined;
+    if (childId && !verified && childId !== input.sourceProviderSessionId) {
+      try { await transport.client.deleteSession(childId); }
+      catch (error) { cleanupError = new UnboundForkError(`OpenCode 未绑定 child 清理失败：${String(error)}`, childId); }
+    }
+    await transport.client.deleteSession(transport.openCodeSessionId).catch(() => undefined);
+    await forgetOpenCodeSession(temporaryId);
+    if (cleanupError) throw cleanupError;
+  }
+}
+
+async function discardOpenCodeFork(input: ForkSessionInput, nativeChildId: string): Promise<void> {
+  if (nativeChildId === input.sourceProviderSessionId) throw new Error("Refusing to delete the Fork source.");
+  const temporaryId = `${input.sessionId}-fork-discard`;
+  const transport = await ensureLive({ ...input, sessionId: temporaryId, runtimeMode: "supervised", onEvent: () => undefined });
+  try { await transport.client.deleteSession(nativeChildId); }
+  finally {
+    await transport.client.deleteSession(transport.openCodeSessionId).catch(() => undefined);
+    await forgetOpenCodeSession(temporaryId);
+  }
+}
+
+/** Inclusive app turn -> first excluded native message (v1 API is exclusive). */
+export function openCodeForkPrefix(source: OpenCodeMessage[], input: ForkSessionInput) {
+  const ids = input.nativeTurns.flatMap((turn) => turn.messageIds ?? []);
+  if (!ids.length) throw new Error("OpenCode native message IDs are missing.");
+  const prefix = source.slice(0, ids.length);
+  if (prefix.length !== ids.length || prefix.some((message, index) => stringField(asRecord(message.info), "id") !== ids[index]))
+    throw new Error("OpenCode application/native message mapping is missing or compacted.");
+  if (source.some((message) => asRecord(message.info)?.summary === true ||
+    KNOWN_HIDDEN_AGENTS.has(stringField(asRecord(message.info), "agent") ?? "") ||
+    message.parts?.some((part) => asRecord(part)?.type === "compaction")))
+    throw new Error("OpenCode compacted history cannot be verified for exact Fork.");
+  if (prefix.some((message) => message.parts?.some((part) => {
+    const record = asRecord(part);
+    return record?.type === "tool" && !["completed", "error"].includes(stringField(asRecord(record.state), "status") ?? "");
+  }))) throw new Error("OpenCode Fork contains an unfinished tool call/result.");
+  return prefix;
+}
+
+function openCodeHistoryContent(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(openCodeHistoryContent);
+  const record = asRecord(value);
+  if (!record) return value;
+  return Object.fromEntries(Object.entries(record).filter(([key]) =>
+    !["id", "sessionID", "messageID", "parentID", "time"].includes(key)).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => [key, openCodeHistoryContent(child)]));
 }
 
 async function isDescendantSession(

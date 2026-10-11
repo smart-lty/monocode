@@ -749,6 +749,7 @@ describe("mapCodexNotification", () => {
     });
     expect(mapped.turnCompleted?.status).toBe("interrupted");
     expect(mapped.activeTurnId).toBeNull();
+    expect(mapped.events).toContainEqual({ type: "turn.cancelled", providerTurnId: "turn_1" });
   });
 
   it.each([

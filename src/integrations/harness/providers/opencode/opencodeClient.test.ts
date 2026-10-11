@@ -15,6 +15,21 @@ vi.mock("../../core/child", () => ({
 
 import { OpenCodeClient } from "./opencodeClient";
 
+it("passes the exclusive native message cutoff only to verified v1 Fork", async () => {
+  mocks.harnessHttp.mockReset();
+  mocks.harnessHttp.mockResolvedValue({ status: 200, body: JSON.stringify({ id: "new_child" }) });
+  const v1 = new OpenCodeClient("http://127.0.0.1:4096", "/repo", "v1");
+  await v1.forkSession("parent", "/repo", "first_excluded");
+  expect(mocks.harnessHttp).toHaveBeenCalledWith(expect.objectContaining({
+    method: "POST", url: "http://127.0.0.1:4096/session/parent/fork?directory=%2Frepo",
+    body: JSON.stringify({ messageID: "first_excluded" }),
+  }));
+  mocks.harnessHttp.mockClear();
+  const v2 = new OpenCodeClient("http://127.0.0.1:4096", "/repo", "v2");
+  await expect(v2.forkSession("parent", "/repo", "first_excluded")).rejects.toThrow("cutoff");
+  expect(mocks.harnessHttp).not.toHaveBeenCalled();
+});
+
 describe("OpenCodeClient.summarizeSession", () => {
   beforeEach(() => {
     mocks.harnessHttp.mockReset();

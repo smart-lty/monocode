@@ -1,3 +1,4 @@
+import { findModel, type ModelSetting } from "../../sessions/model/models";
 import { HARNESSES, type Block, type HarnessId, type Session } from "../../sessions/model/session";
 import { isEqualOrInside, pathKey } from "../../../shared/lib/paths";
 
@@ -102,7 +103,7 @@ function projectRelativeScope(
   return normalized.slice(root.length).replace(/^\/+/, "");
 }
 
-function stringRecord(value: unknown, label: string): Record<string, string> {
+export function stringRecord(value: unknown, label: string): Record<string, string> {
   const input = record(value);
   const entries = Object.entries(input);
   if (entries.length > 32) throw new Error(`Invalid ${label}`);
@@ -112,6 +113,23 @@ function stringRecord(value: unknown, label: string): Record<string, string> {
       required(entry, label, 256),
     ]),
   );
+}
+
+export function validateTaskModelSettings(
+  value: unknown,
+  model: string,
+  settings: ModelSetting[] = [],
+): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  const result = stringRecord(value, "model settings");
+  for (const [key, value] of Object.entries(result)) {
+    const setting = settings.find((item) => item.id === key);
+    if (!setting?.options.some((option) => option.value === value))
+      throw new Error(
+        `Unsupported model setting ${key}=${value} for ${model}. Choose a setting and value from the model catalog.`,
+      );
+  }
+  return result;
 }
 
 export function validateOrchestrationSettings(
@@ -159,6 +177,11 @@ export function validateProposedTasks(
   value: unknown,
   settings: OrchestrationSettings,
   cwd?: string,
+  settingsFor: (harness: HarnessId, model: string) => ModelSetting[] | undefined =
+    (harness, model) => {
+      const found = findModel(model);
+      return found?.harness === harness ? found.settings : undefined;
+    },
 ): ProposedTask[] {
   if (!Array.isArray(value) || !value.length || value.length > 40)
     throw new Error("Provide 1 to 40 assignments");
@@ -209,7 +232,7 @@ export function validateProposedTasks(
       ...(task.modelSettings === undefined
         ? {}
         : {
-            modelSettings: stringRecord(task.modelSettings, "model settings"),
+            modelSettings: validateTaskModelSettings(task.modelSettings, model, settingsFor(harness, model)),
           }),
       files,
       dependsOn: stringList(task.dependsOn ?? [], "dependencies", 40),

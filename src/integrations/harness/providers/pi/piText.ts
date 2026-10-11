@@ -1,3 +1,4 @@
+import { enqueueTextPrompt } from "../../core/textQueue";
 import { modelsFor } from "../../../../features/sessions/model/models";
 import {
   killChild,
@@ -99,17 +100,13 @@ export async function runTextPrompt(
     timeoutMs?: number;
     signal?: AbortSignal;
     onEvent?: (event: HarnessEvent) => void;
+    onQueueState?: (state: "queued" | "running") => void;
   },
 ): Promise<string> {
   const state = stateFor(flavor);
-  const run = state.turns
-    .catch(() => undefined)
-    .then(() => promptOnLive(flavor, input));
-  state.turns = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+  const queued = enqueueTextPrompt(state.turns, input, () => promptOnLive(flavor, input));
+  state.turns = queued.tail;
+  return queued.result;
 }
 
 async function promptOnLive(
@@ -356,6 +353,7 @@ export const runPiTextPrompt = (input: {
   timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: HarnessEvent) => void;
+  onQueueState?: (state: "queued" | "running") => void;
 }) => runTextPrompt(PI_FLAVOR, input);
 
 export const stopOmpTextPrompt = () => stopTextPrompt(OMP_FLAVOR);
@@ -368,4 +366,5 @@ export const runOmpTextPrompt = (input: {
   timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: HarnessEvent) => void;
+  onQueueState?: (state: "queued" | "running") => void;
 }) => runTextPrompt(OMP_FLAVOR, input);

@@ -100,6 +100,15 @@ describe("consumeBtwPrefix", () => {
 });
 
 describe("btwOpenTargetTurnId", () => {
+  it.each(["cancelled", "error"] as const)("skips the timed %s turn and retains the latest real completion", (turnOutcome) => {
+    const turns: Block[][] = [
+      [{ id: "u1", role: "user", text: "Finished", durationMs: 1_000 }, { id: "a1", role: "assistant", text: "Done" }],
+      [{ id: "u2", role: "user", text: "Interrupted", durationMs: 1_000, turnOutcome }, { id: "a2", role: "assistant", text: "Partial" }],
+    ];
+    expect(btwOpenTargetTurnId(turns, turns.flat(), "codex")).toBe("u1");
+    expect(btwOpenTargetTurnId([turns[1]], turns[1], "codex")).toBeUndefined();
+  });
+
   it("targets the latest completed turn while the current turn is still running", () => {
     const blocks = [
       { id: "u1", role: "user" as const, text: "first", durationMs: 1000 },
@@ -472,6 +481,15 @@ describe("buildBtwPrompt", () => {
 });
 
 describe("applyBtwHarnessEvent", () => {
+  it("settles open tools in a Btw reply when its provider dies", () => {
+    const blocks = applyBtwHarnessEvent([
+      { id: "tool", role: "tool", text: "Read source", streaming: true,
+        tool: { callId: "read", status: "in_progress" }, approval: { requestId: 7, decided: "allow" } },
+    ], { type: "session.error", message: "Connection lost" }, "codex", "codex:gpt-6.1-sol", "question");
+    expect(blocks[0]).toMatchObject({ streaming: false, tool: { status: "failed" }, approval: { decided: "allow" } });
+    expect(blocks.at(-1)).toMatchObject({ notice: "error", text: "Connection lost" });
+  });
+
   it("records harness activity blocks for a BTW reply", () => {
     const blocks = applyBtwHarnessEvent(
       [],

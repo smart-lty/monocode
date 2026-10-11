@@ -16,6 +16,8 @@ export type HarnessEvent =
   | { type: "session.error"; message: string }
   | { type: "session.providerBound"; providerSessionId: string }
   | { type: "turn.started"; providerTurnId: string }
+  | { type: "turn.cancelled"; providerTurnId?: string }
+  | { type: "turn.nativeContext"; context: import("../../../features/sessions/model/session").NativeTurnContext }
   | { type: "turn.ready" }
   | {
       type: "session.configChanged";
@@ -184,14 +186,18 @@ export type HarnessSessionInput = {
   controlsAgents?: boolean;
   /** Grants this normal turn access to MonoCode's scoped app CLI. */
   appAccess?: boolean;
+  /** Saved references exist; enables loopback access without Operator powers. */
+  sessionReferenceAccess?: boolean;
+  /** Edited references stay unavailable until onAccepted finishes saving the replacement. */
+  sessionReferenceAuthorizationPending?: boolean;
   onEvent: (event: HarnessEvent) => void;
 };
 
 export type SendTurnInput = HarnessSessionInput & {
   text: string;
   attachments?: Attachment[];
-  /** Called once the provider has accepted the user turn. */
-  onAccepted?: () => void;
+  /** Called once the provider accepts the turn; registry awaits durable-save work. */
+  onAccepted?: () => void | Promise<void>;
 };
 
 export type CompactContextInput = HarnessSessionInput;
@@ -217,3 +223,31 @@ export type RewindLastTurnResult = {
   /** True when the harness already ran the replacement turn. */
   submitted: boolean;
 };
+
+export type ForkSessionInput = {
+  /** A new application ID. Never used to operate on the source live child. */
+  sessionId: string;
+  sourceProviderSessionId: string;
+  cwd: string;
+  providerAccountId?: string;
+  model: string;
+  runtimeMode: RuntimeMode;
+  nativeTurns: import("../../../features/sessions/model/session").NativeTurnContext[];
+};
+
+export type ForkSessionResult = {
+  providerSessionId: string;
+  nativeCutoff: "inclusive-turn" | "exclusive-message";
+  /** Child IDs in application turn order; OpenCode remaps message IDs. */
+  nativeTurns: import("../../../features/sessions/model/session").NativeTurnContext[];
+  /** Dispose this new, still-unbound child if application validation/save fails. */
+  discard?: () => Promise<void>;
+};
+
+/** A native child exists but cleanup failed. It must never be bound implicitly. */
+export class UnboundForkError extends Error {
+  constructor(message: string, readonly providerSessionId: string) {
+    super(message);
+    this.name = "UnboundForkError";
+  }
+}

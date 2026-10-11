@@ -18,9 +18,20 @@
  * too).
  */
 import type { McpTag } from "./mcpPicker";
+import { sanitizeSessionReferences, type SessionReference } from "./sessionReferences";
 
 const drafts = new Map<string, string>();
 const mcpTags = new Map<string, McpTag[]>();
+const sessionReferences = new Map<string, SessionReference[]>();
+
+export function getComposerSessionReferences(sessionId: string): SessionReference[] {
+  return sessionReferences.get(sessionId) ?? [];
+}
+export function setComposerSessionReferences(sessionId: string, value: readonly SessionReference[]): void {
+  const references = sanitizeSessionReferences(value);
+  if (references.length) sessionReferences.set(sessionId, references);
+  else sessionReferences.delete(sessionId);
+}
 
 export function getComposerDraft(sessionId: string): string | undefined {
   return drafts.get(sessionId);
@@ -50,4 +61,5 @@ export function setComposerMcpTags(sessionId: string, tags: McpTag[]): void {
 export function clearComposerDraft(sessionId: string): void {
   drafts.delete(sessionId);
   mcpTags.delete(sessionId);
+  sessionReferences.delete(sessionId);
 }

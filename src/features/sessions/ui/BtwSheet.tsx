@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Plus, RefreshCw, X } from "../../../shared/ui/icons";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, Lock, Plus, RefreshCw, X } from "../../../shared/ui/icons";
 
 import { Composer } from "./Composer";
 import { AgentTranscript } from "./AgentTranscript";
@@ -8,10 +8,15 @@ import { BtwQuestionBurst, type BurstRect } from "./BtwQuestionBurst";
 import { preferredModelSettings, resolveModel } from "../model/models";
 import {
   btwOpenTargetTurnId,
+  btwReturnDraftText,
   btwThreadBlocks,
   btwSurfaceHarness,
+  requestBtwReturnToComposer,
   sessionBtwThreads,
+  supportsBtwHarness,
 } from "../model/btw";
+import { SELECTABLE_AGENT_RESPONSE_ATTR } from "../model/transcriptSelection";
+import { turnLabel } from "./forkChoices";
 import { groupTurns } from "../model/transcriptActivity";
 import {
   DEFAULT_RUNTIME_MODE,
@@ -25,6 +30,10 @@ import {
 type Options = {
   /** False when this session cannot take side questions right now. */
   available: boolean;
+  /** The parent session, which takes a conclusion back into its composer. */
+  sessionId?: string;
+  /** The parent is running: only its latest finished turn is settled. */
+  busy?: boolean;
   blocks: Block[];
   /** The session's current harness; each tab resolves its own from its turn. */
   harness: HarnessId;
@@ -85,6 +94,8 @@ function reducedMotion() {
  */
 export function useBtwConversation({
   available,
+  sessionId,
+  busy = false,
   blocks,
   harness,
   managed = false,
@@ -115,6 +126,8 @@ export function useBtwConversation({
   } | null>(null);
   // Unsent text the side composer starts from; a new key remounts it.
   const [seed, setSeed] = useState({ key: 0, text: "" });
+  // Why the last question did not start, until the next attempt.
+  const [rejected, setRejected] = useState<{ tabId: string; reason: string } | null>(null);
 
   const turns = useMemo(() => groupTurns(blocks, managed), [blocks, managed]);
   const entries = useMemo(
@@ -139,7 +152,8 @@ export function useBtwConversation({
         question:
           tab.thread?.messages.find((message) => message.role === "user")
             ?.text ?? pending?.message.text,
-        status: tab.thread?.status ?? (pending ? "running" : undefined),
+        // An accepted question waits in the provider queue until it runs.
+        status: tab.thread?.status ?? (pending ? "queued" : undefined),
       };
     });
   }, [drafts, entries, optimistic, turns]);
@@ -166,7 +180,11 @@ export function useBtwConversation({
         : persistedMessages,
     [optimisticForTab, persistedMessages],
   );
-  const running = persisted?.status === "running" || !!optimisticForTab;
+  // A queued request is in flight too: it can be stopped, not re-asked.
+  const running =
+    persisted?.status === "running" ||
+    persisted?.status === "queued" ||
+    !!optimisticForTab;
   const selectedModel =
     draftModel ?? persisted?.model ?? (active ? baseModelFor(active) : model);
   const selectedModelSettings = useMemo(() => {
@@ -239,7 +257,16 @@ export function useBtwConversation({
       nextModel || undefined,
       nextSettings,
     );
-    if (accepted === false) return false;
+    if (accepted === false) {
+      setRejected({
+        tabId: tab.id,
+        reason:
+          unavailableFor(tab.turn) ??
+          "This side question couldn’t start. Its turn may have changed; start a new one from the latest finished turn.",
+      });
+      return false;
+    }
+    setRejected(null);
     setOptimistic({
       threadId: tab.id,
       message: { id: messageId, role: "user", text, createdAt: Date.now() },
@@ -247,9 +274,32 @@ export function useBtwConversation({
     return true;
   };
 
-  // A new tab reads from the latest finished turn at the moment it opens.
-  const startDraft = (): BtwTab | null => {
-    const turnId = btwOpenTargetTurnId(turns, blocks, harness, managed);
+  const latestTurnId = btwOpenTargetTurnId(turns, blocks, harness, managed);
+  // The same turn in this hook's grouping, found by its question.
+  const ownTurn = (turn: Block[]) => {
+    const user = turn.find((block) => block.role === "user");
+    return user ? turns.find((entry) => entry.some((block) => block.id === user.id)) : undefined;
+  };
+  const btwTurnHarnessFor = (turn: Block[]) =>
+    btwSurfaceHarness(blocks, turn, harness, turn.find((block) => block.role === "user")?.btwThreads);
+  // Why a side question cannot start at this turn, in the user's words.
+  function unavailableFor(turn: Block[]): string | undefined {
+    if (!available) return "Side questions aren’t available in this session.";
+    const own = ownTurn(turn);
+    const user = own?.find((block) => block.role === "user");
+    if (!own || !user || user.durationMs == null || user.turnOutcome || own.some((block) => block.streaming))
+      return "This turn hasn’t finished yet.";
+    if (!supportsBtwHarness(btwTurnHarnessFor(own)))
+      return "This turn’s provider can’t answer side questions.";
+    if (busy && own[0]?.id !== latestTurnId)
+      return "While the session runs, side questions start from its latest finished turn.";
+    return undefined;
+  }
+
+  // A new tab reads from the given finished turn, or the latest one at the
+  // moment it opens.
+  const startDraft = (at?: Block[]): BtwTab | null => {
+    const turnId = at ? ownTurn(at)?.[0]?.id : latestTurnId;
     const turn = turnId
       ? turns.find((entry) => entry[0]?.id === turnId)
       : undefined;
@@ -275,8 +325,22 @@ export function useBtwConversation({
     }));
   };
 
+  // Stable for the transcript's turn actions; they read the latest state.
+  const latest = useRef({ unavailableFor, startDraft, available });
+  latest.current = { unavailableFor, startDraft, available };
+  const unavailableAt = useCallback(
+    (turn: Block[]) => latest.current.unavailableFor(turn),
+    [],
+  );
+  const openAt = useCallback((turn: Block[]) => {
+    const current = latest.current;
+    if (current.unavailableFor(turn) || !current.startDraft(turn)) return;
+    setRequestedOpen(true);
+  }, []);
+
   return {
     open,
+    available,
     rendered,
     tabs,
     activeTabId,
@@ -289,9 +353,14 @@ export function useBtwConversation({
     seed,
     model: selectedModel,
     modelSettings: selectedModelSettings,
-    canStartDraft: btwOpenTargetTurnId(turns, blocks, harness, managed) != null,
+    canStartDraft: latestTurnId != null,
+    /** The active tab's turn, numbered as the transcript reads it. */
+    asOf: active ? turnLabel(blocks, active.turn[0]?.id) : undefined,
+    rejected: rejected?.tabId === activeTabId ? rejected.reason : undefined,
     finishClose,
     selectTab,
+    openAt,
+    unavailableAt,
     /**
      * Open a new tab. `text` is sent right away, or left unsent in the side
      * composer with `draft`.
@@ -373,13 +442,41 @@ export function useBtwConversation({
         selectTab(remaining[Math.min(index, remaining.length - 1)].id);
       }
     },
-    /** Stop the active tab's streaming answer, keeping what arrived. */
+    /** Stop the active tab's request, queued or answering, keeping what arrived. */
     stop() {
       if (!active) return;
       setOptimistic((current) =>
         current?.threadId === active.id ? null : current,
       );
-      if (persisted?.status === "running") onStop?.(active.turn, active.id);
+      if (persisted?.status === "running" || persisted?.status === "queued")
+        onStop?.(active.turn, active.id);
+    },
+    /**
+     * Take the selected part of one answer back to the parent's composer as
+     * an editable draft. Throws, keeping the sheet open, when the selection
+     * is not inside a finished answer of this thread.
+     */
+    returnToChat(text: string) {
+      if (!sessionId || !persisted) throw new Error("Wait for an answer first.");
+      const selection = window.getSelection();
+      const responseOf = (node: Node | null | undefined) =>
+        (node instanceof Element ? node : node?.parentElement)
+          ?.closest(`[${SELECTABLE_AGENT_RESPONSE_ATTR}]`)
+          ?.getAttribute(SELECTABLE_AGENT_RESPONSE_ATTR);
+      const responseId = responseOf(selection?.anchorNode);
+      if (!responseId || responseId !== responseOf(selection?.focusNode))
+        throw new Error("Select text inside one answer.");
+      const message = persisted.messages.find(
+        (entry) =>
+          entry.role === "assistant" &&
+          (entry.id === responseId || entry.blocks?.some((block) => block.id === responseId)),
+      );
+      if (!message) throw new Error("Wait for this answer to finish.");
+      const request = { sessionId, threadId: persisted.id, messageId: message.id, text };
+      btwReturnDraftText({ id: sessionId, blocks }, request);
+      // The parent composer is inert under the sheet; it takes focus once shown.
+      setRequestedOpen(false);
+      requestBtwReturnToComposer(sessionId, persisted.id, message.id, text);
     },
     retry() {
       if (active && persisted) onRetry(active.turn, persisted.id);
@@ -411,9 +508,26 @@ function compactQuestion(text: string | undefined): string {
 }
 
 function statusClass(status: BtwThread["status"]): string {
+  if (status === "queued") return "bg-content/35";
   if (status === "running") return "bg-amber-300";
   if (status === "error") return "bg-red-300";
+  if (status === "cancelled") return "bg-content/20 ring-1 ring-content/40";
   return "bg-emerald-300";
+}
+
+const STATUS_LABEL: Record<BtwThread["status"], string> = {
+  queued: "Waiting in queue",
+  running: "Answering",
+  ready: "Answered",
+  error: "Couldn’t finish",
+  cancelled: "Stopped",
+};
+
+/** What the side model can see, in plain words; the thread's record is exact. */
+function contextLimit(harness: HarnessId): string {
+  return harness === "codex"
+    ? "Excerpts, plus read-only lookups up to this turn and in sessions it referenced. Attachments by name only."
+    : `Excerpts only, up to 64,000 characters; ${HARNESS_TITLE[harness]} can’t look up more. Attachments by name only.`;
 }
 
 const OPEN_MOTION = {
@@ -504,6 +618,17 @@ export function BtwSheet({
     btw;
   const harness = btw.harness;
   const finishClose = btw.finishClose;
+  const activeStatus = tabs.find((tab) => tab.id === activeTabId)?.status;
+  // The last request ended without finishing. Whether it ever ran is not
+  // known from here, so it reads as its outcome, not as timed work.
+  const lastQuestion = [...messages].reverse().find((message) => message.role === "user");
+  const turnOutcome = useMemo(
+    () =>
+      lastQuestion && (persisted?.status === "cancelled" || persisted?.status === "error")
+        ? { userBlockId: lastQuestion.id, label: persisted.status === "cancelled" ? "Stopped" : "Didn’t finish" }
+        : undefined,
+    [lastQuestion?.id, persisted?.status],
+  );
   // The side thread renders through the main transcript, so it anchors,
   // follows, and folds its work exactly like the conversation behind it.
   const threadBlocks = useMemo(
@@ -734,7 +859,9 @@ export function BtwSheet({
                     >
                       {tab.status ? (
                         <span
-                          aria-hidden
+                          role="img"
+                          aria-label={STATUS_LABEL[tab.status]}
+                          title={STATUS_LABEL[tab.status]}
                           className={`size-1.5 shrink-0 rounded-full ${statusClass(tab.status)}`}
                         />
                       ) : null}
@@ -781,6 +908,33 @@ export function BtwSheet({
             </button>
           </div>
 
+          {activeTabId ? (
+            <div
+              data-btw-scope
+              title={persisted?.contextScope}
+              className="btw-sheet-body flex shrink-0 flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-content/8 px-3.5 py-1.5 text-[11px] leading-4 text-content/50"
+            >
+              <span
+                className="min-w-0 max-w-full truncate text-content/70"
+                title={`As of ${btw.asOf?.label ?? "an earlier turn"} (inclusive)`}
+              >
+                As of {btw.asOf?.label ?? "an earlier turn"} (inclusive)
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <Lock className="size-3" strokeWidth={1.75} />
+                Read-only
+              </span>
+              {activeStatus ? (
+                <span data-btw-status={activeStatus} aria-live="polite">
+                  {STATUS_LABEL[activeStatus]}
+                </span>
+              ) : null}
+              <span className="basis-full text-content/40">
+                Later messages stay out. {contextLimit(harness)}
+              </span>
+            </div>
+          ) : null}
+
           <div className="btw-sheet-body min-h-0 flex-1">
             <AgentTranscript
               key={activeTabId ?? ""}
@@ -794,8 +948,46 @@ export function BtwSheet({
               onSaveNote={onSaveNote}
               onOpenFile={onOpenFile}
               onOpenDiff={onOpenDiff}
+              turnOutcome={turnOutcome}
+              onAddToChat={btw.returnToChat}
+              addToChatLabel="Bring to main chat"
             />
           </div>
+          {btw.rejected ? (
+            <div className="btw-sheet-body shrink-0 px-5 pb-2">
+              <p role="alert" className="text-[12px] leading-4.5 text-amber-200/80">
+                {btw.rejected}
+              </p>
+            </div>
+          ) : null}
+          {persisted?.status === "cancelled" ? (
+            <div className="btw-sheet-body shrink-0 px-5 pb-3">
+              <div className="btw-error btw-cancelled" role="status">
+                <div className="min-w-0">
+                  <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-content/55">
+                    Stopped
+                  </div>
+                  <div className="mt-1 text-[12px] leading-4.5 text-content/65">
+                    You stopped this request. Anything that arrived is kept above.
+                  </div>
+                  {/* The provider may not have confirmed the stop. */}
+                  {persisted.error ? (
+                    <div className="mt-1 text-[12px] leading-4.5 text-amber-200/80">
+                      {persisted.error}
+                    </div>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={btw.retry}
+                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-content/70 transition-colors hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent"
+                >
+                  <RefreshCw className="size-3" strokeWidth={1.75} />
+                  Retry
+                </button>
+              </div>
+            </div>
+          ) : null}
           {persisted?.status === "error" ? (
             <div className="btw-sheet-body shrink-0 px-5 pb-3">
               <div className="btw-error" role="alert">

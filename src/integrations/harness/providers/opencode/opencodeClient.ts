@@ -145,14 +145,18 @@ export class OpenCodeClient {
   async forkSession(
     sessionID: string,
     directory: string,
+    /** Verified v1 cutoff: omit this message and everything after it. */
+    messageID?: string,
   ): Promise<OpenCodeSession> {
+    if (messageID && this.generation !== "v1")
+      throw new Error("OpenCode v2 exact message cutoff has not been verified; use explicit reconstruction.");
     const forked = normalizeSession(
       await this.request<OpenCodeSession>(
         "POST",
         this.path(`/session/${enc(sessionID)}/fork`),
         this.generation === "v2"
           ? { body: {} }
-          : { query: { directory }, body: {} },
+          : { query: { directory }, body: messageID ? { messageID } : {} },
       ),
     );
     if (this.generation === "v1") return forked;

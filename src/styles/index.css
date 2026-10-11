@@ -2,6 +2,7 @@
 @source "../../node_modules/streamdown/dist/*.js";
 @source "../../node_modules/@streamdown/code/dist/*.js";
 @source "../../node_modules/@streamdown/mermaid/dist/*.js";
+@source "../../node_modules/@streamdown/math/dist/*.js";
 
 @custom-variant dark (&:where(html:not(.theme-light), html:not(.theme-light) *));
 
@@ -1911,12 +1912,60 @@ header[data-tauri-drag-region] button {
   border-top: 0;
 }
 
-.agent-markdown [data-streamdown="heading-1"] {
-  font-size: 22px;
+.agent-markdown :is(h1, h2, h3, h4, h5, h6) {
+  line-height: 1.4;
+  font-weight: 600;
+  margin-top: 1.25rem;
+  margin-bottom: 0.5rem;
 }
 
-.agent-markdown [data-streamdown="heading-2"] {
+.agent-markdown h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 1.5rem;
+}
+
+.agent-markdown h2 {
   font-size: 18px;
+  font-weight: 700;
+}
+
+.agent-markdown h3 {
+  font-size: 16px;
+}
+
+.agent-markdown h4 {
+  font-size: 15px;
+  margin-top: 1rem;
+}
+
+.agent-markdown :is(h5, h6) {
+  font-size: 14px;
+  margin-top: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.agent-markdown h6 {
+  color: color-mix(in srgb, var(--color-content) 75%, transparent);
+}
+
+.agent-markdown .markdown-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-block: 0.5rem;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.agent-markdown :is(.markdown-image-loading, .markdown-image-failure) {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--color-content) 15%, transparent);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--color-content) 65%, transparent);
 }
 
 .whats-new-md.agent-markdown [data-streamdown="heading-3"] {
@@ -3600,6 +3649,12 @@ html.theme-light .btw-burst {
   background: color-mix(in srgb, #f87171 7%, transparent);
 }
 
+/* A request the user stopped is not a failure. */
+.btw-error.btw-cancelled {
+  border-color: color-mix(in srgb, var(--color-content) 14%, transparent);
+  background: color-mix(in srgb, var(--color-content) 4%, transparent);
+}
+
 /* The selected project mascot turns banked resets into a tiny status scene. */
 .reset-mascot-scene {
   position: absolute;
@@ -3851,4 +3906,10 @@ html.theme-light .btw-burst {
     var(--color-content) 10%,
     var(--color-background-base)
   );
+}
+
+/* Long display math scrolls within the transcript instead of being clipped. */
+.agent-markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
 }

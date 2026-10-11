@@ -1,4 +1,7 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { remarkLiteralDollars } from "./markdownMath";
+import { cjk } from "@streamdown/cjk";
+import { createMathPlugin } from "@streamdown/math";
+import "katex/dist/katex.min.css";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   createContext,
@@ -15,6 +18,8 @@ import {
   type ReactNode,
 } from "react";
 import { harden } from "rehype-harden";
+import rehypeSanitize from "rehype-sanitize";
+import type { Schema } from "hast-util-sanitize";
 import {
   Block,
   CodeBlock,
@@ -44,13 +49,14 @@ import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { copyText } from "../../../platform/tauri/clipboard";
 import { openPathWithDefaultApp, revealPath } from "../../../platform/tauri/fs";
 import { INBOX_MEDIA_PREFIXES, isInboxMediaUrl } from "../../inbox/model/inboxMedia";
-import { isNoteImagePath } from "../../notes";
 import { IS_MAC, IS_WIN } from "../../../platform/tauri/platform";
 import { InboxMedia } from "../../inbox/ui/InboxMedia";
 import { rehypeHardBreaks } from "./hardBreaks";
 import { rehypeWordFade, usePacedText, useWordFading } from "./wordFade";
 import { isFenceBlock, parseStreamingMarkdown } from "./streamingMarkdown";
 import { HighlightedCodeBlock } from "./HighlightedCodeBlock";
+import { MarkdownImage, rehypeMarkdownImagePaths } from "./AgentMarkdownImages";
+import { rehypePreserveUnknownTags } from "./markdownHtml";
 
 const MERMAID_BASE_CONFIG = {
   startOnLoad: false,
@@ -65,48 +71,25 @@ const mermaid = createLazyMermaidPlugin({
   },
 });
 
-const MARKDOWN_PLUGINS = { code: boundedCode, mermaid };
+const math = createMathPlugin({ singleDollarTextMath: true });
+const MARKDOWN_PLUGINS = { code: boundedCode, mermaid, cjk, math };
 
-const MARKDOWN_REHYPE_PLUGINS: PluggableList = [
-  defaultRehypePlugins.raw,
-  defaultRehypePlugins.sanitize,
-  [
-    harden,
-    {
-      // MarkdownImage remains the final allowlist. The wildcard lets app-owned
-      // relative note URLs reach that component without changing link parsing.
-      allowedImagePrefixes: ["*"],
-      allowedLinkPrefixes: ["*"],
-      allowDataImages: true,
-      imageBlockPolicy: "remove" as const,
+const [, streamdownSchema] = defaultRehypePlugins.sanitize as [unknown, Schema];
+const MARKDOWN_SANITIZE: PluggableList[number] = [
+  rehypeSanitize,
+  {
+    ...streamdownSchema,
+    attributes: {
+      ...streamdownSchema.attributes,
+      // A picture source could replace the validated img URL, including an
+      // Inbox blob, with an unvalidated request. Use the img fallback instead.
+      source: [],
     },
-  ],
-];
-
-const INBOX_MEDIA_REHYPE_PLUGINS: PluggableList = [
-  defaultRehypePlugins.raw,
-  defaultRehypePlugins.sanitize,
-  [
-    harden,
-    {
-      defaultOrigin: "https://inbox.invalid",
-      allowedImagePrefixes: INBOX_MEDIA_PREFIXES,
-      allowedLinkPrefixes: ["*"],
-      allowDataImages: true,
-      imageBlockPolicy: "remove" as const,
+    protocols: {
+      ...streamdownSchema.protocols,
+      src: [...(streamdownSchema.protocols?.src ?? []), "data"],
     },
-  ],
-];
-
-// A reply that streams renders its words as spans that fade in as they land.
-const FADING_MARKDOWN_REHYPE_PLUGINS: PluggableList = [
-  ...MARKDOWN_REHYPE_PLUGINS,
-  rehypeWordFade,
-];
-
-const FADING_INBOX_MEDIA_REHYPE_PLUGINS: PluggableList = [
-  ...INBOX_MEDIA_REHYPE_PLUGINS,
-  rehypeWordFade,
+  },
 ];
 
 type FileLinkMenu = {
@@ -423,66 +406,18 @@ function CodeCopyButton({ code }: { code: string }) {
   );
 }
 
-type MarkdownImageProps = ComponentProps<"img"> & { node?: unknown };
-
-const noteImageSrcCache = new Map<string, string>();
-
-function NoteAssetImage({
-  asset,
-  alt,
-  ...props
-}: Omit<MarkdownImageProps, "src" | "node"> & { asset: string }) {
-  const [src, setSrc] = useState(() => noteImageSrcCache.get(asset));
-
-  useEffect(() => {
-    if (src) return;
-    let cancelled = false;
-    void invoke<string>("notes_image_path", { asset })
-      .then((path) => {
-        const next = convertFileSrc(path);
-        noteImageSrcCache.set(asset, next);
-        if (!cancelled) setSrc(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [asset, src]);
-
-  return (
-    <img
-      {...props}
-      src={src}
-      alt={alt ?? ""}
-      data-note-image={asset}
-      draggable={false}
-      loading="lazy"
-    />
-  );
-}
-
-function MarkdownImage({
-  src,
-  alt,
-  node: _node,
-  ...props
-}: MarkdownImageProps) {
-  const allowRemoteMedia = useContext(RemoteMediaContext);
-  const url = typeof src === "string" ? src.trim() : "";
-  if (url.startsWith("data:image/")) {
-    return <img {...props} src={url} alt={alt ?? ""} />;
-  }
-  if (isNoteImagePath(url)) {
-    return <NoteAssetImage {...props} asset={url} alt={alt} />;
-  }
-  if (!allowRemoteMedia || !url || !isInboxMediaUrl(url)) return null;
-  return <InboxMedia src={url} alt={alt} />;
+function SessionMarkdownImage(
+  props: ComponentProps<"img"> & { node?: unknown },
+) {
+  const inboxOnly = useContext(RemoteMediaContext);
+  const { cwd } = useContext(FileOpenContext);
+  return <MarkdownImage {...props} cwd={cwd} inboxOnly={inboxOnly} />;
 }
 
 const MARKDOWN_COMPONENTS = {
   a: MarkdownLink,
   code: MarkdownCode,
-  img: MarkdownImage,
+  img: SessionMarkdownImage,
 } satisfies Components;
 
 /**
@@ -528,6 +463,7 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   className?: string;
   cwd?: string;
   onOpenFile?: OpenFileFn;
+  /** Use Inbox's restricted GitHub/Linear media fetcher. */
   allowRemoteMedia?: boolean;
   /** Show a newline inside a block as a line break, as a document does (#591). */
   hardBreaks?: boolean;
@@ -549,31 +485,39 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   const remarkPlugins = useMemo<PluggableList>(
     () => [
       ...Object.values(defaultRemarkPlugins),
+      remarkLiteralDollars,
       [remarkWorkspaceFileLinks, { cwd }],
     ],
     [cwd],
   );
   const remoteMedia = !!allowRemoteMedia;
   const paced = usePacedText(text, !!streaming, revealOnMount);
-  const fading = useWordFading(!!streaming || paced.revealing);
+  const active = !!streaming || paced.revealing;
+  const parseMarkdown = useCallback(
+    (content: string) => parseStreamingMarkdown(content, { streaming: active }),
+    [active],
+  );
+  const fading = useWordFading(active);
   // Spans stay while words are fading so a word already on screen keeps its
   // element. Dropping one mid-fade would remount it and fade it again. Once
   // the fade is over they come off, or a finished reply would keep a span per
   // word for as long as this transcript stays mounted.
-  const baseRehypePlugins = fading
-    ? remoteMedia
-      ? FADING_INBOX_MEDIA_REHYPE_PLUGINS
-      : FADING_MARKDOWN_REHYPE_PLUGINS
-    : remoteMedia
-      ? INBOX_MEDIA_REHYPE_PLUGINS
-      : MARKDOWN_REHYPE_PLUGINS;
-  // Hard breaks go last, so nothing after them undoes them, and after the word
-  // fade, whose word spans would otherwise hide the newlines from them.
-  const rehypePlugins = useMemo(
-    () =>
-      hardBreaks ? [...baseRehypePlugins, rehypeHardBreaks] : baseRehypePlugins,
-    [baseRehypePlugins, hardBreaks],
-  );
+  const rehypePlugins = useMemo<PluggableList>(() => [
+    rehypePreserveUnknownTags,
+    defaultRehypePlugins.raw,
+    ...(!remoteMedia ? [[rehypeMarkdownImagePaths, { cwd }] as PluggableList[number]] : []),
+    MARKDOWN_SANITIZE,
+    [harden, {
+      ...(remoteMedia ? { defaultOrigin: "https://inbox.invalid" } : {}),
+      allowedImagePrefixes: remoteMedia ? INBOX_MEDIA_PREFIXES : ["*"],
+      allowedLinkPrefixes: ["*"],
+      allowDataImages: true,
+      imageBlockPolicy: "indicator",
+    }],
+    ...(fading ? [rehypeWordFade] : []),
+    // Hard breaks follow word fade so it cannot hide the newlines from them.
+    ...(hardBreaks ? [rehypeHardBreaks] : []),
+  ], [cwd, fading, remoteMedia, hardBreaks]);
 
   const onFileMenuPick = (id: string) => {
     if (!fileMenu) return;
@@ -618,14 +562,17 @@ export const AgentMarkdown = memo(function AgentMarkdown({
         <>
           <MarkdownFadeContext.Provider value={fading}>
             <Streamdown
+              // Streamdown memoizes its parsed trees independently of plugin
+              // options. A new cwd/media policy must resolve the source anew.
+              key={`${cwd ?? ""}:${remoteMedia}`}
               BlockComponent={DirectionalBlock}
               className={`agent-markdown min-w-0 font-sans text-sm leading-6 ${fading ? "word-fading" : ""} ${className ?? ""}`}
               components={MARKDOWN_COMPONENTS}
               controls={false}
               dir="auto"
-              isAnimating={!!streaming || paced.revealing}
+              isAnimating={active}
               parseIncompleteMarkdown={false}
-              parseMarkdownIntoBlocksFn={parseStreamingMarkdown}
+              parseMarkdownIntoBlocksFn={parseMarkdown}
               plugins={MARKDOWN_PLUGINS}
               remarkPlugins={remarkPlugins}
               rehypePlugins={rehypePlugins}

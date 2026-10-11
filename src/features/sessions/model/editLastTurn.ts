@@ -154,16 +154,18 @@ export function createEditedResendCoordinator(): EditedResendCoordinator {
 export type LastTurnRecall = {
   text: string;
   attachments: Attachment[];
+  sessionReferences?: Block["sessionReferences"];
 };
 
 export function lastTurnRecall(session: Session): LastTurnRecall | null {
   const block = lastUserTurnBlock(session.blocks);
-  if (!block?.text.trim() && !block?.attachments?.length) return null;
+  if (!block?.text.trim() && !block?.attachments?.length && !block?.sessionReferences?.length) return null;
   return {
     text: isOperatorUserTurn(block)
       ? `/operator ${operatorUserPrompt(block)}`
       : block.text,
     attachments: block.attachments ?? [],
+    sessionReferences: block.sessionReferences,
   };
 }
 

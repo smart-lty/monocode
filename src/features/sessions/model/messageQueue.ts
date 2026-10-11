@@ -5,6 +5,14 @@ export function queuedHead(session: Session): QueuedMessage | undefined {
   return session.queuedMessages?.[0];
 }
 
+export function enqueueQueuedMessage(session: Session, message: QueuedMessage): Session {
+  return {
+    ...session,
+    queuedMessages: [...(session.queuedMessages ?? []), message],
+    queueStatus: session.queueStatus === "paused" ? "paused" : "active",
+  };
+}
+
 /** Hold auto-dispatch only while the item about to send is being edited. */
 export function isEditingQueuedHead(session: Session): boolean {
   const head = queuedHead(session);

@@ -41,6 +41,9 @@ import { pathKey, projectName } from "../../../shared/lib/paths";
 import type { SplitDir } from "../../workspace/model/layout";
 import { consumeOperatorCommand } from "../../sessions/model/operatorCommand";
 import { sessionConversationPage, type SessionReadOptions } from "./sessionConversation";
+import { sessionBlocksPage, type SessionBlocksOptions, type SessionBlocksSource } from "./sessionBlocks";
+import { referencedSessionIds, sentSessionReferences } from "../../sessions/model/sessionReferences";
+import type { SessionExportManifest } from "../../sessions/data/sessionStore";
 import {
   CARD_FIELDS,
   parseCard,
@@ -100,6 +103,9 @@ export type AgentAppHost = {
   sessions(cwd: string): Promise<AppSessionListing[]>;
   session(id: string): Promise<Session | null>;
   readConversation?(session: Session, options: SessionReadOptions): Promise<ReturnType<typeof sessionConversationPage>>;
+  /** Must return one complete saved version, never an open UI window. */
+  savedSession?(id: string): Promise<SessionBlocksSource | null>;
+  exportConversation?(sourceSessionId: string, id: string): Promise<SessionExportManifest>;
   send(
     id: string,
     prompt: string,
@@ -170,7 +176,9 @@ export type AgentAppHost = {
 const FIELDS = new Map<string, readonly string[]>([
   ["models.list", []],
   ["sessions.list", ["project"]],
-  ["sessions.read", ["sessionId", "before", "limit", "maxChars", "project"]],
+  ["sessions.read", ["sessionId", "before", "limit", "maxChars", "project", "view", "blockId", "offset", "readVersion", "maxTotalChars"]],
+  ["sessions.export", ["sessionId", "project"]],
+  ["sessions.references", ["cursor", "limit"]],
   ["sessions.send", ["sessionId", "prompt", "project", "notifyOnComplete"]],
   ["sessions.draft", ["sessionId", "prompt", "project"]],
   ["sessions.stop", ["sessionId", "project"]],
@@ -934,14 +942,26 @@ async function handleArtifacts(
   return { ...card, saved: true, attached: true };
 }
 
+/** Historical stopped/finished runs don't make a normal continuation a lead. */
+export function agentAppSourceAllowed(
+  source: Session | undefined,
+  run?: { status: string },
+): source is Session {
+  return !!source && !source.inboxAsk && !source.orchestrationLeadId &&
+    (!run || run.status === "stopped" || run.status === "finished");
+}
+
 export async function handleAgentApp(
   source: Session,
   requestId: string,
   action: string,
   input: Record<string, unknown>,
   host: AgentAppHost,
+  access: "operator" | "references" = "operator",
 ): Promise<unknown> {
   fields(action, input);
+  if (access === "references" && !["sessions.read", "sessions.export", "sessions.references"].includes(action))
+    throw new Error("Session references grant reading only; app action is unauthorized");
   if (action.startsWith("artifacts."))
     return handleArtifacts(source, requestId, action, input, host);
   if (action.startsWith("soul."))
@@ -987,10 +1007,77 @@ export async function handleAgentApp(
       const cwd = requireProject(source, input, host);
       return { cwd, sessions: await host.sessions(cwd) };
     }
+    case "sessions.references": {
+      const refs = sentSessionReferences(source.blocks).filter((ref) => ref.sessionId !== source.id);
+      const limit = input.limit ?? 10;
+      if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 30)
+        throw new Error("limit must be an integer from 1 to 30");
+      const cursor = optionalString(input.cursor, "cursor", 256);
+      const start = cursor ? refs.findIndex((ref) => ref.sessionId === cursor) + 1 : 0;
+      if (cursor && start === 0) throw new Error("Invalid reference cursor; restart from the first page");
+      const items = await Promise.all(refs.slice(start, start + (limit as number)).map(async (ref) => {
+        const saved = await host.savedSession?.(ref.sessionId);
+        return { ...ref, ...(saved ? { title: saved.title, cwd: saved.cwd, updatedAt: saved.updatedAt, readVersion: saved.readVersion } : { unavailable: true }) };
+      }));
+      const page = () => ({ items, nextCursor: start + items.length < refs.length ? items[items.length - 1]?.sessionId : null });
+      while (JSON.stringify({ ok: true, result: page() }).length + 1 > 20000) {
+        if (items.length <= 1) throw new Error("Reference metadata cannot fit the stdout budget");
+        items.pop();
+      }
+      return page();
+    }
+    case "sessions.export": {
+      const id = requiredString(input.sessionId, "sessionId", 256);
+      if (host.isMono(id) || host.isHabitRun?.(id)) throw new Error("Only regular saved sessions can be exported");
+      const referenced = referencedSessionIds(source.blocks).includes(id);
+      if (access === "references" && !referenced) throw new Error("Session was not referenced by a sent user message");
+      if (!referenced) await projectSession(source, id, input, host);
+      if (!host.exportConversation) throw new Error("Saved session export is unavailable");
+      return host.exportConversation(source.id, id);
+    }
     case "sessions.read": {
       const id = requiredString(input.sessionId, "sessionId", 256);
+      const referenced = referencedSessionIds(source.blocks).includes(id);
+      if ((referenced || input.view === "messages" || input.view === "blocks") && (host.isMono(id) || host.isHabitRun?.(id)))
+        throw new Error("Only regular saved sessions support reference reading");
+      if (access === "references" && !referenced) throw new Error("Session was not referenced by a sent user message");
+      if (input.view !== undefined && !["exchanges", "messages", "blocks"].includes(input.view as string))
+        throw new Error("view must be exchanges, messages or blocks");
+      if (input.view === "messages" || input.view === "blocks") {
+        if (!referenced) await projectSession(source, id, input, host);
+        if (!host.savedSession) throw new Error("Lossless saved session reading is unavailable");
+        const saved = await host.savedSession(id);
+        if (!saved) throw new Error("Saved session is unavailable");
+        const maxTotalChars = input.maxTotalChars as number | undefined;
+        if (maxTotalChars !== undefined && (!Number.isSafeInteger(maxTotalChars) || maxTotalChars < 200 || maxTotalChars > 20000))
+          throw new Error("maxTotalChars must be an integer from 200 to 20000");
+        return sessionBlocksPage(saved, {
+          view: input.view,
+          before: optionalString(input.before, "before", 256),
+          blockId: optionalString(input.blockId, "blockId", 256),
+          readVersion: optionalString(input.readVersion, "readVersion", 256),
+          offset: input.offset as number | undefined,
+          limit: input.limit as number | undefined,
+          maxChars: input.maxChars as number | undefined,
+          // Compact CLI wrapper + final newline share the 20000-unit stdout cap.
+          maxTotalChars: Math.min(maxTotalChars ?? 20000, 20000 - '{"ok":true,"result":'.length - '}\n'.length),
+        } satisfies SessionBlocksOptions);
+      }
+      if (["blockId", "offset", "readVersion", "maxTotalChars"].some((key) => input[key] !== undefined))
+        throw new Error("Lossless options require explicit view:messages or view:blocks");
+      if (referenced) {
+        const saved = await host.savedSession?.(id);
+        if (!saved) throw new Error("Referenced saved session is unavailable");
+        // Legacy exchanges keep their truncation/turn cursor semantics, but
+        // don't bypass regular-source filtering or hydrate a cross-project UI.
+        return sessionConversationPage({ ...source, ...saved, blocks: [...saved.blocks] }, {
+          before: optionalString(input.before, "before", 256), limit: input.limit as number | undefined,
+          maxChars: input.maxChars as number | undefined,
+        });
+      }
       const target = id === source.id && host.isMono?.(id)
         ? source : await projectSession(source, id, input, host);
+      if (!target) throw new Error("Referenced session is unavailable");
       const options = {
         before: optionalString(input.before, "before", 256),
         limit: input.limit as number | undefined,

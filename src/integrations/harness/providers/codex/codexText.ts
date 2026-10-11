@@ -1,3 +1,4 @@
+import { enqueueTextPrompt } from "../../core/textQueue";
 import { modelsFor } from "../../../../features/sessions/model/models";
 import {
   killChild,
@@ -11,7 +12,6 @@ import {
   asRecord,
   buildThreadStartParams,
   buildTurnStartParams,
-  isRecoverableThreadResumeError,
   mapCodexNotification,
   stringField,
 } from "./codexProtocol";
@@ -25,9 +25,22 @@ import { mergeStream, streamTextDelta } from "../../core/streamText";
 const TEXT_CHILD_ID = "monocode-codex-text";
 const INIT_TIMEOUT_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 45_000;
+const INTERRUPT_TIMEOUT_MS = 5_000;
 const TEXT_RUNTIME_MODE = "supervised" as const;
 const TEXT_MODEL = "gpt-5.6-luna";
 const TEXT_EFFORT = "low";
+
+const BTW_READ_TOOL = {
+  name: "monocode_read_context",
+  description: "Read saved conversation messages/blocks, only for the selected sources. Parent history ends at the fixed as-of boundary. Paginate with nextBefore or continue a long block with nextOffset/readVersion. No writes or controls.",
+  inputSchema: { type: "object", properties: {
+    sessionId: { type: "string" }, view: { type: "string", enum: ["messages", "blocks"] },
+    before: { type: "string" }, blockId: { type: "string" }, offset: { type: "integer", minimum: 0 },
+    readVersion: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 30 },
+    maxChars: { type: "integer", minimum: 200, maximum: 12000 },
+    maxTotalChars: { type: "integer", minimum: 200, maximum: 8000 },
+  }, required: ["sessionId", "view"], additionalProperties: false },
+};
 
 type LiveText = {
   rpc: JsonRpcClient;
@@ -43,9 +56,14 @@ type LiveText = {
   collecting: boolean;
   output: string;
   closed: boolean;
+  turnId?: string;
+  turnCompleted?: boolean;
+  turnStarted?: (turnId: string, activated?: boolean) => void;
   turnDone: (() => void) | null;
   turnFailed: ((error: Error) => void) | null;
   onEvent?: (event: HarnessEvent) => void;
+  readContext?: TextPromptInput["readContext"];
+  resumed?: boolean;
 };
 
 let live: LiveText | null = null;
@@ -114,29 +132,51 @@ export async function runCodexTextPrompt(
   if (input.model !== undefined && !input.model.trim()) {
     throw new Error("The selected Codex model is unavailable.");
   }
-  const run = turns.catch(() => undefined).then(() => promptOnLive(input));
-  turns = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+  const queued = enqueueTextPrompt(turns, input, () => promptOnLive(input));
+  turns = queued.tail;
+  return queued.result;
 }
 
 async function promptOnLive(input: TextPromptInput): Promise<string> {
   input.signal?.throwIfAborted();
   const session = await ensureLive(input);
-  input.signal?.throwIfAborted();
+  if (input.signal?.aborted) {
+    await dropLive();
+    input.signal.throwIfAborted();
+  }
   session.output = "";
   session.collecting = true;
+  session.turnId = undefined;
+  session.turnCompleted = false;
   session.onEvent = input.onEvent;
+  session.readContext = input.readContext;
   const timeoutMs = input.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let turnStart: Promise<unknown> | undefined;
+  let resolveTurnId!: () => void;
+  let resolveTurnActive!: () => void;
+  const turnIdReady = new Promise<void>((resolve) => { resolveTurnId = resolve; });
+  const turnActive = new Promise<void>((resolve) => { resolveTurnActive = resolve; });
+  session.turnStarted = (turnId, activated = false) => {
+    if (session.turnId && session.turnId !== turnId) return;
+    if (!session.turnId) {
+      session.turnId = turnId;
+      resolveTurnId();
+    }
+    if (activated) {
+      resolveTurnActive();
+    }
+  };
+  const turnPromise = new Promise<void>((resolve, reject) => {
+    session.turnDone = resolve;
+    session.turnFailed = reject;
+  });
+  // Notifications can fail/complete the turn before turn/start returns.
+  void turnPromise.catch(() => undefined);
   let abortHandler: (() => void) | undefined;
   const abortPromise = input.signal
     ? new Promise<void>((_, reject) => {
         abortHandler = () => {
-          void session.rpc
-            .request("turn/interrupt", { threadId: session.threadId })
-            .catch(() => undefined);
           reject(new Error("By-the-way request cancelled"));
         };
         input.signal!.addEventListener("abort", abortHandler, { once: true });
@@ -145,30 +185,34 @@ async function promptOnLive(input: TextPromptInput): Promise<string> {
     : null;
 
   try {
-    const turnPromise = new Promise<void>((resolve, reject) => {
-      session.turnDone = resolve;
-      session.turnFailed = reject;
-    });
-
-    const turnStart = session.rpc.request(
+    input.signal?.throwIfAborted();
+    turnStart = session.rpc.request<{ turn?: { id?: string } }>(
       "turn/start",
-      buildTurnStartParams({
+      { ...buildTurnStartParams({
         threadId: session.threadId,
         runtimeMode: TEXT_RUNTIME_MODE,
-        prompt: input.prompt,
+        prompt: session.resumed && input.resumePrompt ? input.resumePrompt : input.prompt,
         model: session.model || undefined,
         effort: session.effort,
         serviceTier: session.serviceTier,
-        intent: input.intent,
+        intent: "plan",
       }),
+        sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" },
       timeoutMs,
-    );
+    ).then((started) => {
+      const turnId = started.turn?.id?.trim();
+      if (!turnId) throw new Error("Codex did not return the side turn id");
+      if (session.turnId && session.turnId !== turnId)
+        throw new Error("Codex side turn id differs from its start notification");
+      session.turnStarted?.(turnId);
+      return started;
+    });
     await Promise.race([turnStart, ...(abortPromise ? [abortPromise] : [])]);
 
     await Promise.race([
       turnPromise,
       new Promise<void>((_, reject) => {
-        setTimeout(
+        timeout = setTimeout(
           () => reject(new Error("Codex text generation timed out")),
           timeoutMs,
         );
@@ -178,19 +222,65 @@ async function promptOnLive(input: TextPromptInput): Promise<string> {
 
     return session.output;
   } catch (error) {
-    await session.rpc
-      .request("turn/interrupt", { threadId: session.threadId })
-      .catch(() => undefined);
-    if (session.closed) await dropLive();
+    session.collecting = false;
+    if (turnStart && !session.turnCompleted) {
+      // Cancellation must not lose a late start. The provider queue remains
+      // held while we wait for either the response or the matching notification.
+      if (!session.turnId) await Promise.race([
+        turnIdReady,
+        turnStart.then(() => undefined, () => undefined),
+      ]);
+      let cancellationError: Error | undefined;
+      if (!session.turnId && !session.turnCompleted) {
+        cancellationError = new Error("Codex side turnId is unavailable; no interrupt was sent. The dedicated text process was closed; native cancellation is unconfirmed.");
+      } else if (!session.turnCompleted) {
+        try {
+          const interrupt = () => session.rpc.request("turn/interrupt", {
+            threadId: session.threadId, turnId: session.turnId,
+          }, INTERRUPT_TIMEOUT_MS);
+          try { await interrupt(); }
+          catch (failure) {
+            // Installed Codex can return turn/start before registering its
+            // active turn. Retry this specific race only after its notification.
+            if (!(failure instanceof Error) || !/no active turn to interrupt/i.test(failure.message))
+              throw failure;
+            await waitForInterruptedTurn(Promise.race([turnActive, turnPromise]));
+            if (!session.turnCompleted) await interrupt();
+          }
+          await waitForInterruptedTurn(turnPromise);
+        } catch (failure) {
+          cancellationError = new Error(`Codex side interrupt failed (${session.threadId}/${session.turnId}): ${failure instanceof Error ? failure.message : String(failure)}`);
+        }
+      }
+      if (cancellationError) {
+        input.onCancelError?.(cancellationError);
+        throw new Error(`${error instanceof Error ? error.message : String(error)}\n${cancellationError.message}`);
+      }
+    }
     throw error;
   } finally {
+    if (timeout) clearTimeout(timeout);
     if (abortHandler && input.signal) {
       input.signal.removeEventListener("abort", abortHandler);
     }
     session.collecting = false;
     session.turnDone = null;
     session.turnFailed = null;
+    session.turnStarted = undefined;
+    session.onEvent = undefined;
+    session.readContext = undefined;
     await dropLive();
+  }
+}
+
+async function waitForInterruptedTurn(turn: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([turn, new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Codex interrupt completion was not confirmed")), INTERRUPT_TIMEOUT_MS);
+    })]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 async function ensureLive(input: {
@@ -202,6 +292,7 @@ async function ensureLive(input: {
   codexStore?: "mono";
   threadId?: string;
   onThreadId?: (threadId: string) => void;
+  readContext?: TextPromptInput["readContext"];
 }): Promise<LiveText> {
   const model = pickTextModel(input.model);
   const effort = pickTextEffort(model, input.modelSettings);
@@ -300,7 +391,7 @@ async function startLive(
         handleNotification(sessionRef.session, method, params);
       },
       onRequest: (id, method, params) => {
-        void handleServerRequest(rpc, id, method, params);
+        void handleServerRequest(rpc, id, method, params, sessionRef.session);
       },
     },
     { includeJsonrpc: false, label: "codex-text" },
@@ -384,7 +475,6 @@ async function openThread(
   preparedStore?: Awaited<ReturnType<typeof prepareCodexMonoContext>>,
 ): Promise<void> {
   let opened: { thread?: { id?: string } } | undefined;
-  let hasSavedContext = false;
   if (session.codexStore === "mono") {
     const { path } = await resolveCodexBinary();
     const store =
@@ -397,8 +487,7 @@ async function openThread(
         threadId: requestedThreadId,
       }));
     session.storeConfig = store.config;
-    hasSavedContext = store.hasThread;
-    if (requestedThreadId && hasSavedContext)
+    if (requestedThreadId && store.hasThread)
       await restoreMonoCodexAgentState(
         session.providerAccountId,
         requestedThreadId,
@@ -410,6 +499,8 @@ async function openThread(
     model: session.model || undefined,
     serviceTier: session.serviceTier,
   });
+  params.sandbox = "read-only";
+  params.approvalPolicy = "never";
   if (session.storeConfig)
     params.config = {
       ...session.storeConfig,
@@ -426,11 +517,9 @@ async function openThread(
         INIT_TIMEOUT_MS,
       );
     } catch (error) {
-      if (hasSavedContext) throw error;
-      if (!isRecoverableThreadResumeError(error)) throw error;
-      opened = undefined;
+      throw new Error(`Saved side thread could not be resumed. Start a new discussion explicitly. ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!opened?.thread?.id?.trim()) opened = undefined;
+    if (opened?.thread?.id?.trim() !== requestedThreadId) throw new Error("Codex did not resume the requested saved side thread; no context was reinjected.");
   }
   if (!opened) {
     opened = await session.rpc.request<{ thread?: { id?: string } }>(
@@ -438,6 +527,7 @@ async function openThread(
       {
         ...params,
         ...(ephemeral ? { ephemeral: true } : {}),
+        dynamicTools: [BTW_READ_TOOL],
       },
       INIT_TIMEOUT_MS,
     );
@@ -447,6 +537,7 @@ async function openThread(
   session.cwd = cwd;
   session.threadId = threadId;
   session.ephemeral = ephemeral;
+  session.resumed = !!requestedThreadId;
 }
 async function dropLive(): Promise<void> {
   const current = live;
@@ -464,14 +555,29 @@ function handleNotification(
   method: string,
   params: unknown,
 ): void {
-  if (!session || !session.collecting) {
-    if (session && method === "turn/completed") {
+  if (!session || session.closed) return;
+  const record = asRecord(params);
+  if (stringField(record, "threadId") !== session.threadId) return;
+  const turn = asRecord(record?.turn);
+  const turnId = stringField(turn, "id");
+  if (method === "turn/started" && turnId) session.turnStarted?.(turnId, true);
+  if (method === "turn/completed") {
+    if (!turnId || (session.turnId && session.turnId !== turnId)) return;
+    session.turnStarted?.(turnId, true);
+    session.turnCompleted = true;
+    const status = stringField(turn, "status") ?? "completed";
+    if (status === "failed") {
+      const message = stringField(asRecord(turn?.error), "message") ?? "Codex turn failed";
+      session.turnFailed?.(new Error(message));
+    } else {
       session.turnDone?.();
-      session.turnDone = null;
-      session.turnFailed = null;
     }
-    return;
+    session.turnDone = null;
+    session.turnFailed = null;
   }
+  if (!session.collecting) return;
+  const itemTurnId = stringField(record, "turnId");
+  if (itemTurnId && session.turnId && itemTurnId !== session.turnId) return;
 
   const mapped = mapCodexNotification(method, params);
   for (const event of mapped.events) {
@@ -484,27 +590,28 @@ function handleNotification(
     return;
   }
 
-  if (method === "turn/completed") {
-    const turn = asRecord(asRecord(params)?.turn);
-    const status = stringField(turn, "status") ?? "completed";
-    if (status === "failed") {
-      const message =
-        stringField(asRecord(turn?.error), "message") ?? "Codex turn failed";
-      session.turnFailed?.(new Error(message));
-    } else {
-      session.turnDone?.();
-    }
-    session.turnDone = null;
-    session.turnFailed = null;
-  }
 }
 
 async function handleServerRequest(
   rpc: JsonRpcClient,
   id: JsonRpcId,
   method: string,
-  _params: unknown,
+  params: unknown,
+  session?: LiveText | null,
 ): Promise<void> {
+  if (method === "item/tool/call") {
+    const call = asRecord(params);
+    let success = false;
+    let text: string;
+    try {
+      if (call?.tool !== BTW_READ_TOOL.name || !session?.readContext || call.threadId !== session.threadId)
+        throw new Error("Only selected read-only conversation sources are available.");
+      text = JSON.stringify(await session.readContext(call.arguments as Parameters<NonNullable<TextPromptInput["readContext"]>>[0]));
+      success = true;
+    } catch (error) { text = JSON.stringify({ error: error instanceof Error ? error.message : String(error), readOnly: true }); }
+    await rpc.respond(id, { success, contentItems: [{ type: "inputText", text }] }).catch(() => undefined);
+    return;
+  }
   if (
     method === "item/commandExecution/requestApproval" ||
     method === "item/fileChange/requestApproval"

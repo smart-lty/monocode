@@ -466,12 +466,6 @@ export function OrchestrationPreview({
   const [error, setError] = useState<string>();
   const [expanded, setExpanded] = useState<string[]>([]);
   const [showAll, setShowAll] = useState(false);
-  useEffect(() => {
-    if (actions)
-      void orchestrator
-        .hydrate(proposal.leadId)
-        .catch((reason: unknown) => setError(String(reason)));
-  }, [actions, proposal.leadId]);
   const editable =
     proposal.status === "ready" && !run && !pending && !busy && !!actions;
   const planning = proposal.status === "planning";
@@ -770,7 +764,7 @@ export function OrchestrationPreview({
             <WorkerHelp />
           </div>
           <span>
-            {run?.status ??
+            {(run?.stopPending ? "Stop incomplete" : run?.status) ??
               (proposal.status === "approved"
                 ? "Approved"
                 : proposal.status === "ready"

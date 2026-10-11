@@ -1208,7 +1208,7 @@ describe("sidebar orchestration card", () => {
     expect(tooltip.textContent).toContain("Review changes");
     expect(tooltip.textContent).toContain("Working");
     expect(tooltip.textContent).toContain("Check types");
-    expect(tooltip.textContent).toContain("Done");
+    expect(tooltip.textContent).toContain("Awaiting review");
 
     act(() =>
       trigger.dispatchEvent(new MouseEvent("mouseout", { bubbles: true })),

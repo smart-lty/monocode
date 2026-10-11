@@ -6,6 +6,7 @@ import { type TranscriptSelection } from "../model/transcriptSelection";
 type Props = {
   selection: TranscriptSelection | null;
   onAddToChat?: (text: string) => void;
+  addToChatLabel?: string;
   onAddToNotes?: (text: string) => void | Promise<void>;
   onDismiss: () => void;
 };
@@ -13,6 +14,7 @@ type Props = {
 export function TranscriptSelectionMenu({
   selection,
   onAddToChat,
+  addToChatLabel = "Add to chat",
   onAddToNotes,
   onDismiss,
 }: Props) {
@@ -50,7 +52,8 @@ export function TranscriptSelectionMenu({
       <div className="flex min-w-36 flex-col items-stretch gap-0.5">
         {onAddToChat ? (
           <SelectionAction
-            label="Add to chat"
+            label={addToChatLabel}
+            failure="Could not add it."
             onSelect={() => onAddToChat(selection.text)}
             onDismiss={onDismiss}
           >
@@ -64,6 +67,7 @@ export function TranscriptSelectionMenu({
         {onAddToNotes ? (
           <SelectionAction
             label="Add to notes"
+            failure="Could not save note."
             onSelect={() => onAddToNotes(selection.text)}
             onDismiss={onDismiss}
           >
@@ -81,11 +85,13 @@ export function TranscriptSelectionMenu({
 
 function SelectionAction({
   label,
+  failure,
   children,
   onSelect,
   onDismiss,
 }: {
   label: string;
+  failure: string;
   children: ReactNode;
   onSelect: () => void | Promise<void>;
   onDismiss: () => void;
@@ -122,7 +128,7 @@ function SelectionAction({
           role="alert"
           className="max-w-xs px-2.5 py-1 text-xs text-content/70"
         >
-          Could not save note. {error}
+          {failure} {error}
         </span>
       )}
     </>

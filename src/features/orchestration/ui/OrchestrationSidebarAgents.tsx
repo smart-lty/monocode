@@ -1,3 +1,4 @@
+import { canStopRun } from "../model/orchestrationState";
 import { useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { findModel } from "../../sessions/model/models";
 import { orchestrator } from "../model/orchestration";
@@ -51,7 +52,7 @@ export function OrchestrationSidebarAgents({
     });
     if (isOpen && revealed === sessionId) workers.inspect(null);
   };
-  // A saved run has no live entry, so the card stays read-only after a reload.
+  // App restores saved runs independently from transcript card visibility.
   const run = runs.find((entry) => entry.leadId === leadId);
   const stopping = !!run?.tasks.some(
     (task) => task.status === "running" || task.status === "cancelling",
@@ -81,7 +82,14 @@ export function OrchestrationSidebarAgents({
   const solidAction =
     "rounded bg-content/15 px-1.5 py-0.5 text-[11px] text-content/75 hover:bg-content/25 hover:text-content disabled:opacity-35";
   return (
-    <div className="relative mt-1.5">
+    <div
+      className="relative mt-1.5"
+      // The parent session card captures pointers for dragging. Isolate the
+      // entire panel, including run controls below the worker list, so mouse
+      // clicks reach their buttons instead of being retargeted to the card.
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
       <div className="mb-0.5 px-0.5 flex items-center justify-between text-[11px] text-content/45">
         <span>
           {summary.tasks.length}{" "}
@@ -102,8 +110,6 @@ export function OrchestrationSidebarAgents({
       <div
         aria-label="Orchestrated agents"
         className="-mx-2 flex touch-pan-y flex-col gap-px"
-        onPointerDown={(event) => event.stopPropagation()}
-        onClick={(event) => event.stopPropagation()}
       >
         {summary.tasks.map((task) => {
           // Something waiting on an answer opens itself; it cannot be missed.
@@ -243,8 +249,18 @@ export function OrchestrationSidebarAgents({
           {error ?? run?.error}
         </p>
       )}
-      {/* Stopping a run belongs to the composer, which stops the lead and its
-          agents together. Resume has no other home, so it stays. */}
+      {run && canStopRun(run) && (
+        <div className="mt-1.5 flex justify-end border-t border-stroke pt-1.5">
+          <button
+            type="button"
+            className={action}
+            disabled={pending}
+            onClick={() => void perform(() => orchestrator.stopRun(leadId))}
+          >
+            Stop orchestration
+          </button>
+        </div>
+      )}
       {run?.status === "paused" && (
         <div className="mt-1.5 space-y-1.5 border-t border-stroke pt-1.5">
           <p className="px-0.5 text-[11px] leading-relaxed text-content/45">

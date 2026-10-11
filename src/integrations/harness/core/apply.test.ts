@@ -29,6 +29,7 @@ import {
 import {
   appendUser,
   applyHarnessEvent,
+  applyHarnessEvents,
   appendSteerUser,
   promoteLastAssistantToPlan,
   stopStreaming,
@@ -175,6 +176,55 @@ describe("background work", () => {
 });
 
 describe("turn duration", () => {
+  it.each(["cancelled", "error"] as const)(
+    "persists %s without losing partial output or changing inherited work",
+    (outcome) => {
+      const inherited: Block[] = [
+        { id: "old-user", role: "user", text: "Before the fork", durationMs: 50, inherited: true },
+        { id: "old-tool", role: "tool", text: "Historical work", inherited: true,
+          tool: { callId: "old-call", status: "completed" } },
+      ];
+      const original = JSON.stringify(inherited);
+      now = 1_000;
+      let session = appendUser({ ...newSession("codex", "/tmp"), blocks: inherited }, "Cancelable child turn");
+      const userId = session.blocks.at(-1)!.id;
+      session = applyHarnessEvent(session, { type: "turn.started", providerTurnId: "child-turn" });
+      session = applyHarnessEvent(session, {
+        type: "tool.started", callId: "sleep", title: "sleep 60", kind: "execute", status: "in_progress",
+      });
+      session = applyHarnessEvent(session, { type: "approval.requested", requestId: 7, callId: "sleep", title: "sleep 60" });
+      session = applyHarnessEvent(session, { type: "approval.resolved", requestId: 7, decision: "allow" });
+      session = applyHarnessEvent(session, { type: "message.delta", text: "PARTIAL-KEEP" });
+      now = 29_000;
+      const ended = outcome === "error"
+        ? applyHarnessEvent(session, { type: "session.error", message: "Connection lost" })
+        : stopStreaming(session, now, outcome);
+      expect(ended.busy).toBe(false);
+      expect(ended.blocks.find((block) => block.id === userId)).toMatchObject({
+        turnOutcome: outcome, durationMs: 28_000,
+      });
+      expect(ended.blocks.find((block) => block.tool?.callId === "sleep")).toMatchObject({
+        streaming: false, tool: { status: outcome === "error" ? "failed" : "cancelled" },
+        approval: { decided: "allow" },
+      });
+      expect(ended.blocks.find((block) => block.text === "PARTIAL-KEEP")?.streaming).toBe(false);
+      expect(JSON.stringify(ended.blocks.filter((block) => block.inherited))).toBe(original);
+      expect(sanitizeSessionForPersist(ended).blocks.find((block) => block.id === userId)?.turnOutcome).toBe(outcome);
+      const late = applyHarnessEvent(ended, { type: "tool.updated", callId: "sleep", status: "completed" });
+      expect(late).toBe(ended);
+      expect(applyHarnessEvents(ended, [
+        { type: "message.delta", text: "LATE-WRONG" },
+        { type: "reasoning.delta", text: "LATE-WRONG" },
+        { type: "session.error", message: "LATE-WRONG" },
+      ])).toBe(ended);
+      const next = appendUser(ended, "Independent next turn");
+      expect(applyHarnessEvent(next, { type: "turn.cancelled", providerTurnId: "child-turn" })).toBe(next);
+      const nextAnswer = applyHarnessEvent(next, { type: "message.delta", text: "NEXT-OK" });
+      expect(nextAnswer.blocks.at(-1)?.text).toBe("NEXT-OK");
+      expect(nextAnswer.blocks.find((block) => block.id === userId)?.turnOutcome).toBe(outcome);
+    },
+  );
+
   it("records the selected provider and model on a user turn", () => {
     const session = appendUser(
       newSession("claude", "/tmp", "claude:opus-5"),
@@ -208,6 +258,12 @@ describe("turn duration", () => {
     now = 90_000;
     session = stopStreaming(session);
     expect(session.blocks[0]?.durationMs).toBe(4_000);
+  });
+
+  it("does not turn a finished boundary into a cancellation when idle work stops", () => {
+    const finished = stopStreaming(appendUser(newSession("codex", "/tmp"), "Done"));
+    const stopped = stopStreaming({ ...finished, busy: true }, Date.now(), "cancelled");
+    expect(stopped.blocks[0].turnOutcome).toBeUndefined();
   });
 
   it("records duration when the turn errors", () => {

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { isMonoSession } from "../../monos/model/mono";
+import { isMonoSession, listMonos } from "../../monos/model/mono";
+import { sanitizeSessionReferences, type SessionReference, type SessionReferenceSnapshot } from "../model/sessionReferences";
 import { sanitizeMonoSpawnedSessions } from "../../monos/model/monoSpawnedSessions";
 import {
   isWeakToolTitle,
@@ -43,6 +44,8 @@ import type {
   MessageQueueStatus,
   TurnModel,
   TurnMetrics,
+  NativeTurnContext,
+  SessionForkOrigin,
 } from "../model/session";
 
 import { HARNESSES, RUNTIME_MODES } from "../model/session";
@@ -268,11 +271,12 @@ function sanitizeQueuedMessages(value: unknown): QueuedMessage[] {
       HARNESSES.includes(handoff.to)
         ? handoff
         : undefined;
+    const sessionReferences = sanitizeSessionReferences(message.sessionReferences);
     if (
       !message.text.trim() &&
       !attachments.length &&
       !noteCard &&
-      !handoffCard
+      !handoffCard && !sessionReferences.length
     )
       return [];
     return [
@@ -286,6 +290,7 @@ function sanitizeQueuedMessages(value: unknown): QueuedMessage[] {
         attachments,
         ...(noteCard ? { noteCard } : {}),
         ...(handoffCard ? { handoffCard } : {}),
+        ...(sessionReferences.length ? { sessionReferences } : {}),
         ...(completion ? { monoSessionCompletion: completion } : {}),
         ...(["default", "plan", "build", "orchestrate"].includes(
           message.intent ?? "",
@@ -488,6 +493,55 @@ export async function listSessionsByProject(
     cwd: normalizeProjectPath(cwd),
   });
   return rows.map(normalizeSummary);
+}
+
+export type SessionReferenceCandidate = SessionReference & {
+  model: string;
+  updatedAt: number;
+  userTurnCount: number;
+  relevance: number;
+  snippet?: string;
+};
+export type SessionReferencePickerOptions = {
+  currentSessionId: string;
+  scope: "project" | "all";
+  /** Application project path; never sessionWorkCwd/worker executionCwd. */
+  projectCwd: string;
+  query?: string;
+  search?: "title" | "content";
+  cursor?: string;
+  limit?: number;
+};
+export type SessionReferenceCandidatesPage = {
+  items: SessionReferenceCandidate[];
+  nextCursor: string | null;
+};
+export type SessionReferencePickerLoader = (options: SessionReferencePickerOptions) => Promise<SessionReferenceCandidatesPage>;
+
+/** Both title and explicit content searches cover the entire selected scope. */
+export function listSessionReferenceCandidates(options: SessionReferencePickerOptions): Promise<SessionReferenceCandidatesPage> {
+  return invoke("session_reference_candidates", { options: {
+    currentSessionId: options.currentSessionId,
+    cwd: options.scope === "project" ? normalizeProjectPath(options.projectCwd) : null,
+    query: options.query ?? "", search: options.search ?? "title",
+    cursor: options.cursor ?? null, limit: options.limit ?? 100,
+    excludedSessionIds: listMonos().flatMap((mono) => mono.sessionId ? [mono.sessionId] : []).sort(),
+  } });
+}
+
+/** A raw saved record; avoids hydration repairs, UI windows and live mutations. */
+export function getSessionReferenceSnapshot(sessionId: string): Promise<SessionReferenceSnapshot | null> {
+  if (isMonoSession(sessionId)) return Promise.resolve(null);
+  return invoke("session_reference_snapshot", { sessionId });
+}
+
+export type SessionExportManifest = {
+  schemaVersion: number; sessionId: string; updatedAt: number; readVersion: string;
+  path: string; manifestPath: string; bytes: number; sha256: string;
+  blockCount: number; attachmentCount: number; fixed: true; scope: string; omissions: string[];
+};
+export function exportSessionReference(sourceSessionId: string, sessionId: string): Promise<SessionExportManifest> {
+  return invoke("session_reference_export", { sourceSessionId, sessionId });
 }
 
 export function rebaseProjectSessions(
@@ -891,6 +945,10 @@ function sanitizeBlock(
   if (image) next.image = image;
   if (block.startedAt != null) next.startedAt = block.startedAt;
   if (block.durationMs != null) next.durationMs = block.durationMs;
+  if (block.role === "user" &&
+    (block.turnOutcome === "cancelled" || block.turnOutcome === "error")) {
+    next.turnOutcome = block.turnOutcome;
+  }
   if (
     (block.role === "assistant" || block.role === "approval") &&
     typeof block.monoHabit?.id === "string" &&
@@ -912,6 +970,10 @@ function sanitizeBlock(
   const turnModel = sanitizeTurnModel(block.turnModel);
   if (block.role === "user" && turnModel) next.turnModel = turnModel;
   if (block.role === "user" && block.draft) next.draft = true;
+  if (block.role === "user") {
+    const references = sanitizeSessionReferences(block.sessionReferences);
+    if (references.length) next.sessionReferences = references;
+  }
   if (block.role === "user" && block.monocode) next.monocode = true;
   if (
     block.role === "user" &&
@@ -948,6 +1010,7 @@ function sanitizeBlock(
   const turnMetrics = sanitizeTurnMetrics(block.turnMetrics);
   if (block.role === "user" && turnMetrics) next.turnMetrics = turnMetrics;
   if (block.tool) next.tool = block.tool;
+  if (block.inherited === true) next.inherited = true;
   if (block.approval?.decided) {
     next.approval = {
       requestId: block.approval.requestId,
@@ -962,12 +1025,18 @@ function sanitizeBlock(
   const taskList = sanitizeTaskList(block.taskList);
   if (taskList) next.taskList = taskList;
   else if (block.role === "tasks") return null;
-  const plan = sanitizePlan(block.plan, block.text);
+  const plan = sanitizePlan(block.plan, block.text, block.inherited === true);
   if (block.orchestration)
     next.orchestration = restoreOrchestrationProposal(block.orchestration);
   if (plan) next.plan = plan;
   else if (block.role === "plan") {
     next.plan = { status: "ready", originalText: block.text };
+  }
+  if (block.role === "user") {
+    const context = sanitizeNativeTurnContext(block.nativeContext);
+    if (context) next.nativeContext = context;
+    const origin = sanitizeForkOrigin(block.forkOrigin);
+    if (origin) next.forkOrigin = origin;
   }
   const handoff = sanitizeHandoff(block.handoff);
   if (handoff) next.handoff = handoff;
@@ -1096,8 +1165,10 @@ function sanitizeBtwThreads(
     const createdAt = sanitizeTimestamp(record.createdAt);
     const updatedAt = sanitizeTimestamp(record.updatedAt);
     const status =
+      record.status === "queued" ||
       record.status === "running" ||
       record.status === "ready" ||
+      record.status === "cancelled" ||
       record.status === "error"
         ? record.status
         : undefined;
@@ -1127,7 +1198,7 @@ function sanitizeBtwThreads(
         : undefined;
     const modelSettings = sanitizeStringRecord(record.modelSettings);
     const providerThreadId = sanitizeNestedId(record.providerThreadId);
-    const interrupted = hydrate && status === "running";
+    const interrupted = hydrate && (status === "running" || status === "queued");
     return [
       {
         id,
@@ -1140,6 +1211,8 @@ function sanitizeBtwThreads(
         ...(model ? { model } : {}),
         ...(modelSettings ? { modelSettings } : {}),
         ...(providerThreadId ? { providerThreadId } : {}),
+        ...(typeof record.contextScope === "string" ? { contextScope: record.contextScope } : {}),
+        ...(sanitizeSessionReferences(record.readSources).length ? { readSources: sanitizeSessionReferences(record.readSources) } : {}),
         ...(interrupted
           ? {
               error:
@@ -1153,6 +1226,56 @@ function sanitizeBtwThreads(
     ];
   });
   return threads.length > 0 ? threads : undefined;
+}
+
+export function sanitizeNativeTurnContext(value: unknown): NativeTurnContext | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<NativeTurnContext>;
+  const sessionId = sanitizeNestedId(record.sessionId);
+  if (!sessionId || !["codex", "opencode"].includes(record.harness ?? "") ||
+    !["provider", "fork"].includes(record.source ?? "")) return undefined;
+  const turnId = sanitizeNestedId(record.turnId);
+  const userMessageId = sanitizeNestedId(record.userMessageId);
+  const messageIds = Array.isArray(record.messageIds) ? record.messageIds.flatMap((id) => {
+    const next = sanitizeNestedId(id); return next ? [next] : [];
+  }) : [];
+  return { harness: record.harness!, sessionId, source: record.source!,
+    ...(turnId ? { turnId } : {}), ...(userMessageId ? { userMessageId } : {}),
+    ...(messageIds.length ? { messageIds: [...new Set(messageIds)] } : {}) };
+}
+
+export function sanitizeForkOrigin(value: unknown): SessionForkOrigin | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<SessionForkOrigin>;
+  const sourceSessionId = sanitizeNestedId(record.sourceSessionId);
+  const sourceUserBlockId = sanitizeNestedId(record.sourceUserBlockId);
+  const sourceEndBlockId = sanitizeNestedId(record.sourceEndBlockId);
+  const requestId = sanitizeNestedId(record.requestId);
+  const createdAt = sanitizeTimestamp(record.createdAt);
+  if (!sourceSessionId || !sourceUserBlockId || !sourceEndBlockId || !requestId || createdAt == null ||
+    record.cutoff !== "completed-turn-inclusive" || !["native", "visible-history", "handoff"].includes(record.strategy ?? "")) return undefined;
+  const blocks = Array.isArray(record.blocks) ? record.blocks.flatMap((block) => {
+    const sourceId = sanitizeNestedId(block?.sourceId), childId = sanitizeNestedId(block?.childId);
+    return sourceId && childId ? [{ sourceId, childId }] : [];
+  }) : [];
+  const warnings = Array.isArray(record.warnings) ? record.warnings.filter((item): item is string => typeof item === "string") : [];
+  const sourceProviderSessionId = sanitizeNestedId(record.sourceProviderSessionId);
+  const sourceNativeId = sanitizeNestedId(record.sourceNativeId);
+  const coverage = record.coverage;
+  const recoveryId = sanitizeNestedId(record.recovery?.unboundNativeSessionId);
+  return { sourceSessionId, sourceUserBlockId, sourceEndBlockId, requestId, createdAt,
+    cutoff: "completed-turn-inclusive", strategy: record.strategy!, blocks, warnings,
+    ...(sourceProviderSessionId ? { sourceProviderSessionId } : {}), ...(sourceNativeId ? { sourceNativeId } : {}),
+    ...(record.nativeCutoff === "inclusive-turn" || record.nativeCutoff === "exclusive-message" ? { nativeCutoff: record.nativeCutoff } : {}),
+    ...(recoveryId && typeof record.recovery?.reason === "string" ? {
+      recovery: { unboundNativeSessionId: recoveryId, reason: record.recovery.reason },
+    } : {}),
+    ...(coverage && Number.isSafeInteger(coverage.chars) && coverage.chars >= 0 &&
+      Number.isSafeInteger(coverage.visibleBlocks) && coverage.visibleBlocks >= 0 ? { coverage: {
+        chars: coverage.chars, visibleBlocks: coverage.visibleBlocks, complete: coverage.complete === true,
+        omitted: Array.isArray(coverage.omitted) ? coverage.omitted.filter((item): item is string => typeof item === "string") : [],
+      } } : {}),
+  };
 }
 
 function sanitizeGeneratedImage(
@@ -1258,7 +1381,7 @@ function sanitizeInterjection(
   };
 }
 
-function sanitizePlan(value: unknown, text: string): PlanBlockMeta | null {
+function sanitizePlan(value: unknown, text: string, inherited = false): PlanBlockMeta | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const status = record.status;
@@ -1278,7 +1401,7 @@ function sanitizePlan(value: unknown, text: string): PlanBlockMeta | null {
   return {
     ...(key ? { key } : {}),
     // A restarted app cannot still be executing this approval.
-    status: status === "streaming" || status === "building" ? "ready" : status,
+    status: !inherited && (status === "streaming" || status === "building") ? "ready" : status,
     ...(originalText ? { originalText } : {}),
     ...(approvedText ? { approvedText } : {}),
     ...(record.edited === true ? { edited: true } : {}),

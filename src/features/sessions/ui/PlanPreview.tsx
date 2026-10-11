@@ -11,9 +11,23 @@ type Props = {
   harness?: HarnessId;
   model?: string;
   modelSettings?: Record<string, string>;
+  /** Copied into a fork: shown as history, never built from here. */
+  inherited?: boolean;
   onOpen?: () => void;
   onBuild?: (target?: PlanBuildTarget) => void;
 };
+
+/** A plan copied into a fork keeps the status it had in the source session. */
+export function historicalPlanLabel(status: PlanBlockMeta["status"] | undefined) {
+  return status === "built"
+    ? "Historical plan · built in source"
+    : status === "ready"
+      ? "Historical plan · not built"
+      : "Historical plan";
+}
+
+export const HISTORICAL_PLAN_TITLE =
+  "This plan was inherited from the source session and can’t be built again here.";
 
 export function PlanPreview({
   text,
@@ -23,20 +37,23 @@ export function PlanPreview({
   harness,
   model,
   modelSettings,
+  inherited = false,
   onOpen,
   onBuild,
 }: Props) {
   const title = planTitle(text);
   const summary = planSummary(text);
   const buildDisabled =
+    inherited ||
     busy ||
     streaming ||
     !text.trim() ||
     plan?.status === "streaming" ||
     plan?.status === "building" ||
     plan?.status === "built";
-  const buildLabel =
-    plan?.status === "building"
+  const buildLabel = inherited
+    ? historicalPlanLabel(plan?.status)
+    : plan?.status === "building"
       ? "Building…"
       : plan?.status === "built"
         ? "Built"
@@ -97,7 +114,7 @@ export function PlanPreview({
                 <div className="flex items-center font-sans">
                   <button
                     type="button"
-                    title="Build this plan"
+                    title={inherited ? HISTORICAL_PLAN_TITLE : "Build this plan"}
                     disabled={buildDisabled}
                     className={`flex h-6 shrink-0 items-center gap-1 bg-content px-2 font-sans text-[11px] text-background-base hover:bg-content/90 disabled:cursor-not-allowed disabled:opacity-40 ${
                       harness ? "rounded-l-md" : "rounded-md"

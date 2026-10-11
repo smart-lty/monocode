@@ -59,7 +59,12 @@ export function MessageQueue({
     onEditingChange?.();
   };
   const saveEdit = (message: QueuedMessage) => {
-    if (!editDraft.trim() && message.attachments.length === 0) return;
+    if (
+      !editDraft.trim() &&
+      message.attachments.length === 0 &&
+      !message.sessionReferences?.length
+    )
+      return;
     onEdit?.(message.id, editDraft);
     setEditingId(undefined);
     setEditDraft("");
@@ -98,6 +103,8 @@ export function MessageQueue({
         ) : null}
         {messages.map((message, index) => {
           const sending = sendingId === message.id;
+          const references = message.sessionReferences?.length ?? 0;
+          const referenceLabel = `${references} referenced session${references === 1 ? "" : "s"}`;
           const editing = editingId === message.id;
           const label =
             (message.monoSessionCompletion
@@ -107,6 +114,7 @@ export function MessageQueue({
               : message.text.trim()) ||
             message.noteCard?.title ||
             message.handoffCard?.brief ||
+            (references && !message.attachments.length ? referenceLabel : "") ||
             `${message.attachments.length} attachment${message.attachments.length === 1 ? "" : "s"}`;
           return (
             <div
@@ -141,7 +149,9 @@ export function MessageQueue({
                     title="Save queued message"
                     aria-label="Save queued message"
                     disabled={
-                      !editDraft.trim() && message.attachments.length === 0
+                      !editDraft.trim() &&
+                      message.attachments.length === 0 &&
+                      !references
                     }
                     onClick={() => saveEdit(message)}
                     className="grid size-6 shrink-0 place-items-center rounded-md hover:bg-content/10 hover:text-content disabled:opacity-30"
@@ -164,6 +174,11 @@ export function MessageQueue({
                     <div className="truncate text-content/80" title={label}>
                       {label}
                     </div>
+                    {references ? (
+                      <div className="truncate text-[11px] text-content/45">
+                        {referenceLabel} · readable after this message is sent
+                      </div>
+                    ) : null}
                     {message.error ? (
                       <p role="alert" className="text-red-400">
                         {message.error}

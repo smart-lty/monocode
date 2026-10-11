@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { setHarnessModels, resetHarnessModelOverlays } from "../../sessions/model/models";
+afterEach(resetHarnessModelOverlays);
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   completeOrchestrationProposal,
   completeOrRepairOrchestrationProposal,
@@ -286,6 +288,16 @@ describe("orchestration proposals", () => {
     ).toThrow('Assignment "ui" has invalid file scope "C:src\\settings"');
   });
   it("keeps an explicitly selected worker effort and rejects malformed settings", () => {
+    setHarnessModels("codex", [{ id: "codex:test", harness: "codex", name: "Worker", settings: [
+      { id: "reasoningEffort", label: "Reasoning", kind: "select", value: "high", options: [
+        { value: "high", label: "High" }, { value: "xhigh", label: "Extra high" },
+      ] },
+    ] }]);
+    for (const modelSettings of [{ reasoningEffort: "typo" }, { effort: "high" }]) {
+      const result = completeOrchestrationProposal(draft, JSON.stringify({ ...payload, tasks: [{ ...task, modelSettings }] }));
+      expect(result.status).toBe("invalid");
+      expect(result.error).toContain("Unsupported model setting");
+    }
     expect(
       validateProposedTasks(
         [

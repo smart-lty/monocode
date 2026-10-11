@@ -102,6 +102,8 @@ export type OrchestrationRun = {
   workspace?: OrchestrationWorkspace;
   canonicalRoot?: string;
   status: "active" | "paused" | "stopped" | "finished";
+  /** A terminal run may still need another attempt to stop a process. */
+  stopPending?: boolean;
   allowedHarnesses: HarnessId[];
   allowedModels?: OrchestrationChoice[];
   proposalId?: string;
@@ -200,4 +202,13 @@ export function normalizeOrchestrationRun(
       state: statusByDispatch.get(dispatch.id) ?? dispatch.state,
     })),
   };
+}
+
+export function isLiveRun(run: Pick<OrchestrationRun, "status">): boolean {
+  return run.status === "active" || run.status === "paused";
+}
+
+export function canStopRun(run: OrchestrationRun): boolean {
+  return isLiveRun(run) || !!run.stopPending || run.tasks.some((task) =>
+    task.status === "running" || task.status === "cancelling");
 }

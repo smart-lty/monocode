@@ -177,6 +177,9 @@ it("deletes the temporary session when generation is cancelled", async () => {
   await waitFor(() => !!outbound("session/prompt"), "session/prompt");
   controller.abort();
   await expect(result).rejects.toThrow("By-the-way request cancelled");
+  // Cancellation reaches the caller immediately; the provider queue still
+  // waits for the independent temporary-session cleanup to finish.
+  await vi.waitFor(() => expect(execChild).toHaveBeenCalledTimes(1));
   expect(execChild).toHaveBeenCalledWith(
     "/fake/grok",
     [

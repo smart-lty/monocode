@@ -155,6 +155,12 @@ import {
 } from "../../features/files/ui/ExplorerMenu";
 import { FileTree } from "../../features/files/ui/FileTree";
 import { HarnessIcon } from "../../features/sessions/ui/HarnessIcon";
+import { formatRelative } from "../../shared/lib/relativeTime";
+import {
+  dropSessionReference,
+  highlightSessionReferenceTarget,
+  sessionReferenceDropTarget,
+} from "../../features/sessions/model/sessionReferenceDrop";
 import { LiveAgentsPreview } from "../../features/sessions/ui/LiveAgentsPreview";
 import { ProjectRail } from "./ProjectRail";
 import { InboxNotificationMenu } from "../../features/inbox/ui/InboxNotificationMenu";
@@ -3124,7 +3130,7 @@ function SessionListItem({
   return <li ref={ref}>{children}</li>;
 }
 
-const SessionCard = memo(function SessionCard({
+export const SessionCard = memo(function SessionCard({
   session,
   isActive,
   isSelected,
@@ -3305,7 +3311,13 @@ const SessionCard = memo(function SessionCard({
       prefetchTimer.current = null;
     }
     onPrefetch?.(session.id);
-    if (!onPlaceOnPane && !onListDrop) return;
+    // Dropping on a composer adds a reference; the composer checks the rest.
+    const referenceable =
+      !session.orchestrationLeadId &&
+      !session.sidebarHidden &&
+      !session.archived &&
+      !isMonoSession(session.id);
+    if (!onPlaceOnPane && !onListDrop && !referenceable) return;
     const handle = event.currentTarget;
     const pointerId = event.pointerId;
     const startX = event.clientX;
@@ -3337,6 +3349,20 @@ const SessionCard = memo(function SessionCard({
             edge: "left",
           });
         }
+      }
+      const referenceTarget = referenceable
+        ? sessionReferenceDropTarget(ev.clientX, ev.clientY, session.id)
+        : null;
+      highlightSessionReferenceTarget(referenceTarget);
+      if (referenceTarget) {
+        setListTarget(null);
+        if (onPlaceOnPane)
+          setExternalPaneDrop({
+            fromId: session.id,
+            overId: null,
+            edge: "left",
+          });
+        return;
       }
       setListTarget(
         onListDrop
@@ -3373,6 +3399,7 @@ const SessionCard = memo(function SessionCard({
       window.removeEventListener("pointercancel", onUp);
       window.removeEventListener("keydown", onKey);
       restoreSelection();
+      highlightSessionReferenceTarget(null);
       setDragging(false);
       setExternalPaneDrop(null);
       setListTarget(null);
@@ -3384,6 +3411,18 @@ const SessionCard = memo(function SessionCard({
       if (!active) return;
       skipClickUntil.current = performance.now() + 400;
       if (!commit) return;
+      const referenceTarget = referenceable
+        ? sessionReferenceDropTarget(lastX, lastY, session.id)
+        : null;
+      if (referenceTarget) {
+        dropSessionReference(referenceTarget, {
+          sessionId: session.id,
+          title: session.title,
+          cwd: session.cwd,
+          harness: session.harness,
+        });
+        return;
+      }
       const listOver = onListDrop
         ? sessionListDropFromPoint(lastX, lastY, session.id)
         : null;
@@ -3858,27 +3897,4 @@ function TightDiffNumber({ value }: { value: number }) {
 function formatGitLabel(repo?: string, branch?: string): string {
   if (repo && branch) return `${repo}/${branch}`;
   return branch || repo || "";
-}
-
-function formatRelative(value: number, now: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "";
-  const seconds = Math.max(0, Math.round((now - value) / 1000));
-  if (seconds < 60) return "now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    const rest = minutes % 60;
-    return rest ? `${hours}h ${rest}m` : `${hours}h`;
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d`;
-  try {
-    return new Intl.DateTimeFormat(undefined, {
-      month: "short",
-      day: "numeric",
-    }).format(new Date(value));
-  } catch {
-    return "";
-  }
 }

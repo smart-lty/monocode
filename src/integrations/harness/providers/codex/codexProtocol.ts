@@ -630,6 +630,9 @@ function mapTurnTerminal(
     events.push({ type: "session.error", message: error });
   } else if (status === "failed") {
     events.push({ type: "session.error", message: "Codex turn failed." });
+  } else if (status === "interrupted" || status === "cancelled") {
+    const providerTurnId = stringField(turn, "id") ?? stringField(rec, "turnId");
+    events.push({ type: "turn.cancelled", ...(providerTurnId ? { providerTurnId } : {}) });
   }
   return {
     events,

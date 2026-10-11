@@ -1,3 +1,4 @@
+import { enqueueTextPrompt } from "../../core/textQueue";
 import { AcpClient } from "../../core/acp";
 import {
   killChild,
@@ -68,13 +69,11 @@ export async function runCursorTextPrompt(input: {
   timeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: HarnessEvent) => void;
+  onQueueState?: (state: "queued" | "running") => void;
 }): Promise<string> {
-  const run = turns.catch(() => undefined).then(() => promptOnLive(input));
-  turns = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+  const queued = enqueueTextPrompt(turns, input, () => promptOnLive(input));
+  turns = queued.tail;
+  return queued.result;
 }
 
 async function promptOnLive(input: {

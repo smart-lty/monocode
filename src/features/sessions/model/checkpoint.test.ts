@@ -75,3 +75,50 @@ it("does not capture a workspace when no local turn was started", async () => {
   await checkpoint.finishSessionTurn("s", "/repo");
   expect(invoke).not.toHaveBeenCalled();
 });
+
+it("queues the immutable new worker baseline before its first execution and preserves retained mode", async () => {
+  const baseline = deferred();
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "session_checkpoint_ensure") await baseline.promise;
+    return undefined;
+  });
+  const ensure = checkpoint.ensureSessionCheckpoint("worker", "/isolated", { worker: true });
+  const turn = checkpoint.beginSessionTurn("worker", "/isolated", { required: true });
+  await Promise.resolve();
+  expect(invoke).toHaveBeenCalledOnce();
+  expect(invoke).toHaveBeenCalledWith("session_checkpoint_ensure", { sessionId: "worker", cwd: "/isolated", worker: true });
+  baseline.resolve();
+  await Promise.all([ensure, turn]);
+  await checkpoint.ensureSessionCheckpoint("worker", "/isolated", { worker: false });
+  expect(invoke).toHaveBeenLastCalledWith("session_checkpoint_ensure", { sessionId: "worker", cwd: "/isolated", worker: false });
+});
+
+it("propagates required worker baseline and result capture failures", async () => {
+  vi.mocked(invoke).mockRejectedValueOnce(new Error("No baseline"));
+  await expect(checkpoint.beginSessionTurn("worker", "/isolated", { required: true })).rejects.toThrow("No baseline");
+  vi.mocked(invoke).mockResolvedValue(undefined);
+  const turnId = await checkpoint.beginSessionTurn("worker", "/isolated", { required: true });
+  vi.mocked(invoke).mockRejectedValueOnce(new Error("Result was not durable"));
+  await expect(checkpoint.finishSessionTurn("worker", "/isolated", { turnId, required: true })).rejects.toThrow("not durable");
+});
+
+it("recovers only an already saved turn after stopping, without initializing a replacement baseline", async () => {
+  const stopped = deferred();
+  const finish = checkpoint.finishSessionTurn("worker", "/isolated", {
+    recover: true, required: true, after: stopped.promise,
+  });
+  const apply = checkpoint.applySessionCheckpoint("worker", "/isolated", "/lead", ["src"]);
+  await Promise.resolve();
+  expect(invoke).not.toHaveBeenCalled();
+  stopped.resolve();
+  await Promise.all([finish, apply]);
+  expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual([
+    "session_checkpoint_finish_turn", "session_checkpoint_apply",
+  ]);
+  expect(invoke).toHaveBeenCalledWith("session_checkpoint_finish_turn", {
+    sessionId: "worker", cwd: "/isolated", turnId: null,
+  });
+  expect(invoke).toHaveBeenCalledWith("session_checkpoint_apply", {
+    sessionId: "worker", fromCwd: "/isolated", toCwd: "/lead", files: ["src"],
+  });
+});

@@ -26,6 +26,10 @@ import type { PlanBuildTarget, Session } from "../../sessions/model/session";
 import { Play } from "../../../shared/ui/icons";
 import { BuildTargetButton } from "../../sessions/ui/SecondOpinionButton";
 import {
+  HISTORICAL_PLAN_TITLE,
+  historicalPlanLabel,
+} from "../../sessions/ui/PlanPreview";
+import {
   loadDiffViewer,
   subscribeDiffViewer,
 } from "../../settings/model/settings";
@@ -315,14 +319,19 @@ function PlanSurface({
     );
   }
 
+  // A plan inherited by a fork is history: shown, selectable, never rebuilt
+  // or rewritten from here.
+  const inherited = !!block.inherited;
   const buildDisabled =
+    inherited ||
     !!session?.busy ||
     !block.text.trim() ||
     block.plan?.status === "streaming" ||
     block.plan?.status === "building" ||
     block.plan?.status === "built";
-  const buildLabel =
-    block.plan?.status === "building"
+  const buildLabel = inherited
+    ? historicalPlanLabel(block.plan?.status)
+    : block.plan?.status === "building"
       ? "Building…"
       : block.plan?.status === "built"
         ? "Built"
@@ -346,6 +355,7 @@ function PlanSurface({
             <button
               type="button"
               disabled={buildDisabled}
+              title={inherited ? HISTORICAL_PLAN_TITLE : undefined}
               onClick={() => onBuildPlan(plan.sessionId, block.id)}
               className={`flex h-6 items-center gap-1.5 bg-content px-2.5 font-sans text-[11px] font-medium text-background-base hover:bg-content/90 disabled:cursor-not-allowed disabled:opacity-40 ${
                 session ? "rounded-l-md" : "rounded-md"
@@ -372,15 +382,18 @@ function PlanSurface({
             aria-label="Plan markdown"
             spellCheck={false}
             value={block.text}
+            readOnly={inherited}
             disabled={
-              remote ||
-              block.plan?.status === "streaming" ||
-              block.plan?.status === "building" ||
-              block.plan?.status === "built"
+              !inherited &&
+              (remote ||
+                block.plan?.status === "streaming" ||
+                block.plan?.status === "building" ||
+                block.plan?.status === "built")
             }
-            onChange={(event) =>
-              onUpdatePlan(plan.sessionId, block.id, event.currentTarget.value)
-            }
+            onChange={(event) => {
+              if (!inherited)
+                onUpdatePlan(plan.sessionId, block.id, event.currentTarget.value);
+            }}
             className="h-full w-full resize-none overflow-auto bg-transparent px-5 pb-5 pt-14 font-mono text-[13px] leading-6 text-content outline-none disabled:opacity-70"
           />
         }

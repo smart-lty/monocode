@@ -14,6 +14,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -189,6 +190,32 @@ import {
   type McpTag,
 } from "../model/mcpPicker";
 import { getComposerMcpTags, setComposerMcpTags } from "../model/draftCache";
+import {
+  sanitizeSessionReferences,
+  type SessionReference,
+} from "../model/sessionReferences";
+import {
+  getSessionReferenceSnapshot,
+  type SessionReferencePickerLoader,
+} from "../data/sessionStore";
+import {
+  removeSessionToken,
+  sessionQueryPreselects,
+  sessionTokenAt,
+  setSessionTokenScope,
+  type SessionReferenceScope,
+  type SessionToken,
+} from "../model/sessionPicker";
+import { SESSION_REFERENCE_DROP } from "../model/sessionReferenceDrop";
+import {
+  useSessionReferencePicker,
+  type SessionPickerSearch,
+} from "./useSessionReferencePicker";
+import {
+  SessionReferencePicker,
+  sessionPickerOptionId,
+} from "./SessionReferencePicker";
+import { SessionReferenceChips } from "./SessionReferenceChip";
 import { type McpConnection } from "../../settings/model/mcp";
 import {
   getCachedMcpSettings,
@@ -233,6 +260,10 @@ type Props = {
   inboxCard?: InboxComposerCard;
   noteCard?: NoteComposerCard;
   handoffCard?: HandoffComposerCard;
+  /** Task-3 renders/removes these cards and calls the shared change callback. */
+  sessionReferences?: SessionReference[];
+  onSessionReferencesChange?: (references: SessionReference[]) => void;
+  onSearchSessionReferences?: SessionReferencePickerLoader;
   question?: UserQuestionPrompt;
   busy?: boolean;
   /** Allow typed text to replace Stop with Send while a turn is running. */
@@ -275,7 +306,7 @@ type Props = {
     options?: { draft?: boolean },
   ) => boolean | void;
   canSaveDraft?: boolean;
-  onSaveDraft?: (text: string, attachments: Attachment[]) => boolean | void;
+  onSaveDraft?: (text: string, attachments: Attachment[], sessionReferences?: SessionReference[]) => boolean | void;
   onStop?: () => void;
   onCompactContext?: () => boolean;
   onPlaceInFolder?: (target: SessionFolderTarget) => void;
@@ -358,6 +389,9 @@ export function Composer({
   inboxCard,
   noteCard,
   handoffCard,
+  sessionReferences = [],
+  onSessionReferencesChange,
+  onSearchSessionReferences,
   question,
   busy = false,
   allowBusySubmit = true,
@@ -461,7 +495,7 @@ export function Composer({
       (initialDraft ?? "").trim().length > 0 ||
       !!inboxCard ||
       !!noteCard ||
-      !!handoffCard,
+      !!handoffCard || sessionReferences.length > 0,
   );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [pasteError, setPasteError] = useState<string | null>(null);
@@ -523,9 +557,51 @@ export function Composer({
 
   const mentionOpen =
     !remote && mention !== null && (looksLikeProject(cwd) || notesEnabled);
+  const referencesRef = useRef(sessionReferences);
+  referencesRef.current = sessionReferences;
+  const referencesEnabled =
+    !remote &&
+    !!sessionId &&
+    !!onSearchSessionReferences &&
+    !!onSessionReferencesChange;
+  const sessionTokenRef = useRef<SessionToken | null>(null);
+  const [sessionToken, setSessionToken] = useState<SessionToken | null>(null);
+  const [sessionSearch, setSessionSearch] =
+    useState<SessionPickerSearch>("title");
+  const [sessionActiveState, setSessionActiveState] = useState<{
+    key: string | null;
+    index: number;
+  }>({ key: null, index: -1 });
+  /** Escape closes the picker for this token only, keyed by its start. */
+  const dismissedSessionTokenRef = useRef<number | null>(null);
+  const composingRef = useRef(false);
+  const advanceSessionActiveRef = useRef(false);
+  const sessionPickerId = useId();
+  const sessionPickerOpen = referencesEnabled && sessionToken !== null;
+  const sessionPicker = useSessionReferencePicker({
+    loader: onSearchSessionReferences,
+    request: sessionPickerOpen
+      ? {
+          scope: sessionToken.scope,
+          query: sessionToken.query,
+          search: sessionSearch,
+        }
+      : null,
+    currentSessionId: sessionId,
+    projectCwd: looksLikeProject(cwd) ? cwd : null,
+  });
+  const sessionContentRow =
+    sessionSearch === "title" && !!sessionToken?.query.trim();
+  const sessionOptionCount =
+    sessionPicker.items.length + (sessionContentRow ? 1 : 0);
+  const referencedIds = useMemo(
+    () => new Set(sessionReferences.map((entry) => entry.sessionId)),
+    [sessionReferences],
+  );
   const navigationEmpty =
     draft.length === 0 &&
     attachments.length === 0 &&
+    sessionReferences.length === 0 &&
     !inboxCard &&
     !noteCard &&
     !handoffCard;
@@ -626,10 +702,10 @@ export function Composer({
           files.length > 0 ||
           !!inboxCard ||
           !!noteCard ||
-          !!handoffCard,
+          !!handoffCard || sessionReferences.length > 0,
       );
     },
-    [inboxCard, noteCard, handoffCard],
+    [inboxCard, noteCard, handoffCard, sessionReferences],
   );
 
   // A leading mode command in the text shows the same pill as picking the mode.
@@ -694,7 +770,7 @@ export function Composer({
 
   useEffect(() => {
     syncHasValue(ref.current?.value ?? "", attachmentsRef.current);
-  }, [inboxCard, noteCard, handoffCard, syncHasValue]);
+  }, [inboxCard, noteCard, handoffCard, sessionReferences, syncHasValue]);
 
   const addAttachments = useCallback(
     (incoming: Attachment[]) => {
@@ -920,6 +996,7 @@ export function Composer({
       return;
     }
     draftResetTokenRef.current = draftResetToken;
+    onSessionReferencesChange?.([]);
     pasteGenerationRef.current += 1;
     draftRevisionRef.current += 1;
     if (ref.current) {
@@ -941,7 +1018,7 @@ export function Composer({
     setCreatingSkill(false);
     setCreateError(null);
     syncHasValue("", attachmentsRef.current);
-  }, [draftResetToken, onDraftChange, syncHasValue]);
+  }, [draftResetToken, onDraftChange, onSessionReferencesChange, syncHasValue]);
 
   const syncHighlightScroll = useCallback((el: HTMLTextAreaElement) => {
     const highlight = highlightRef.current;
@@ -964,13 +1041,232 @@ export function Composer({
     return () => cancelAnimationFrame(frame);
   }, [draft, syncHighlightScroll]);
 
+  const updateSessionToken = useCallback((found: SessionToken | null) => {
+    let next = found;
+    if (next && dismissedSessionTokenRef.current === next.start) next = null;
+    else if (!next) dismissedSessionTokenRef.current = null;
+    const prev = sessionTokenRef.current;
+    if (!next || !prev || prev.start !== next.start || !next.query.trim())
+      setSessionSearch("title");
+    if (
+      prev === next ||
+      (prev &&
+        next &&
+        prev.start === next.start &&
+        prev.end === next.end &&
+        prev.scope === next.scope &&
+        prev.query === next.query)
+    )
+      return;
+    sessionTokenRef.current = next;
+    setSessionToken(next);
+    // A row picked in an earlier token never carries over to the next one.
+    if (!next) setSessionActiveState({ key: null, index: -1 });
+  }, []);
+
   const syncTokensFromTextarea = (el: HTMLTextAreaElement) => {
     if (creatingSkill) return;
     const cursor = el.selectionStart ?? 0;
     const token = slashTokenAt(el.value, cursor, hasNativeCommands(harness));
     setSlash(token);
-    setMention(token ? null : mentionTokenAt(el.value, cursor));
+    // Pinyin is still being composed: keep the last committed query.
+    if (composingRef.current) return;
+    const hash =
+      !token && referencesEnabled ? sessionTokenAt(el.value, cursor) : null;
+    updateSessionToken(hash);
+    setMention(token || hash ? null : mentionTokenAt(el.value, cursor));
   };
+
+  // Programmatic edits (send, restore, quote) can remove the token text.
+  useEffect(() => {
+    const el = ref.current;
+    if (!sessionTokenRef.current || !el || composingRef.current) return;
+    updateSessionToken(
+      referencesEnabled
+        ? sessionTokenAt(el.value, el.selectionStart ?? 0)
+        : null,
+    );
+  }, [draft, referencesEnabled, updateSessionToken]);
+
+  // The selected row belongs to one settled request, derived during render so
+  // a key pressed right after results land never sees a stale selection. A
+  // fresh request starts unselected unless the query clearly names a session;
+  // colors, issue numbers and a bare `#` keep Enter/Tab as they are.
+  const sessionRequestKey = sessionPickerOpen
+    ? `${sessionToken.scope}|${sessionSearch}|${sessionToken.query.trim()}`
+    : null;
+  const sessionReadyKey = sessionPicker.ready ? sessionRequestKey : null;
+  const sessionItemCount = sessionPicker.items.length;
+  const sessionPreselect =
+    !!sessionReadyKey &&
+    sessionItemCount > 0 &&
+    (sessionSearch === "content" ||
+      sessionQueryPreselects(sessionToken?.query ?? ""));
+  const sessionActive = !sessionReadyKey
+    ? -1
+    : sessionActiveState.key === sessionReadyKey
+      ? sessionActiveState.index
+      : sessionPreselect
+        ? 0
+        : -1;
+  const setSessionActive = (next: number | ((index: number) => number)) =>
+    setSessionActiveState({
+      key: sessionReadyKey,
+      index: typeof next === "function" ? next(sessionActive) : next,
+    });
+  useEffect(() => {
+    advanceSessionActiveRef.current = false;
+  }, [sessionRequestKey]);
+  useEffect(() => {
+    if (!advanceSessionActiveRef.current) return;
+    advanceSessionActiveRef.current = false;
+    setSessionActive(Math.min(sessionActive + 1, sessionItemCount - 1));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionItemCount]);
+
+  const addSessionReferences = useCallback(
+    (
+      incoming: SessionReference[],
+      token?: SessionToken | null,
+      focus = true,
+    ) => {
+      // The parent re-renders with initialDraft; keep the caret where it is.
+      positionedInitialDraft.current = true;
+      const el = ref.current;
+      if (el && token && el.value[token.start] === "#") {
+        const removed = removeSessionToken(el.value, token);
+        el.value = removed.text;
+        resizeComposer(el);
+        el.setSelectionRange(removed.cursor, removed.cursor);
+        draftRevisionRef.current += 1;
+        setDraft(removed.text);
+        // Before the parent re-renders for the new card: it hands the cached
+        // draft back as initialDraft, which would restore the token.
+        onDraftChange?.(removed.text);
+      }
+      const current = referencesRef.current;
+      const next = sanitizeSessionReferences([...current, ...incoming]).filter(
+        (entry) => entry.sessionId !== sessionId,
+      );
+      if (next.length !== current.length) {
+        referencesRef.current = next;
+        onSessionReferencesChange?.(next);
+      }
+      updateSessionToken(null);
+      if (focus) el?.focus();
+    },
+    [onDraftChange, onSessionReferencesChange, sessionId, updateSessionToken],
+  );
+
+  const removeSessionReference = useCallback(
+    (referenceId: string) => {
+      positionedInitialDraft.current = true;
+      const next = referencesRef.current.filter(
+        (entry) => entry.sessionId !== referenceId,
+      );
+      referencesRef.current = next;
+      onSessionReferencesChange?.(next);
+      ref.current?.focus();
+    },
+    [onSessionReferencesChange],
+  );
+
+  const pickSessionOption = (index: number) => {
+    // Rows from an older query or scope stay visible while the next page
+    // loads, but they are not choices for the current token.
+    if (!sessionReadyKey) return;
+    const item = sessionPicker.items[index];
+    if (item) {
+      addSessionReferences(
+        [
+          {
+            sessionId: item.sessionId,
+            title: item.title,
+            cwd: item.cwd,
+            harness: item.harness,
+          },
+        ],
+        sessionTokenRef.current,
+      );
+      return;
+    }
+    if (index === sessionPicker.items.length && sessionContentRow)
+      setSessionSearch("content");
+  };
+
+  const changeSessionScope = (scope: SessionReferenceScope) => {
+    const el = ref.current;
+    const token = sessionTokenRef.current;
+    if (!el || !token || token.scope === scope) return;
+    const next = setSessionTokenScope(el.value, token, scope);
+    el.value = next.text;
+    el.setSelectionRange(next.cursor, next.cursor);
+    draftRevisionRef.current += 1;
+    setDraft(next.text);
+    updateSessionToken(next.token);
+    el.focus();
+  };
+
+  // A drop resolves asynchronously; it only lands on the composer and session
+  // that received it, and never pulls focus from wherever the user went.
+  const dropTargetRef = useRef({
+    mounted: true,
+    sessionId,
+    add: addSessionReferences,
+  });
+  dropTargetRef.current.sessionId = sessionId;
+  dropTargetRef.current.add = addSessionReferences;
+  useEffect(() => {
+    const target = dropTargetRef.current;
+    target.mounted = true;
+    return () => {
+      target.mounted = false;
+    };
+  }, []);
+  useEffect(() => {
+    const box = boxRef.current;
+    if (!box || !referencesEnabled || disabled) return;
+    const onDrop = (event: Event) => {
+      const dropped = (event as CustomEvent<SessionReference>).detail;
+      if (!dropped || dropped.sessionId === sessionId) return;
+      const target = dropTargetRef.current;
+      const droppedOn = sessionId;
+      const stale = () => !target.mounted || target.sessionId !== droppedOn;
+      // Only sessions the picker could list are accepted (sent, ordinary).
+      void getSessionReferenceSnapshot(dropped.sessionId)
+        .then((source) => {
+          if (stale()) return;
+          if (!source) {
+            setPasteError(
+              "This session can't be referenced. Only ordinary sessions with a sent message can be added.",
+            );
+            return;
+          }
+          setPasteError(null);
+          const active = document.activeElement;
+          target.add(
+            [
+              {
+                sessionId: source.id,
+                title: source.title,
+                cwd: source.cwd,
+                harness: source.harness,
+              },
+            ],
+            null,
+            !active || active === document.body || box.contains(active),
+          );
+        })
+        .catch((error: unknown) => {
+          if (!stale())
+            setPasteError(
+              error instanceof Error ? error.message : String(error),
+            );
+        });
+    };
+    box.addEventListener(SESSION_REFERENCE_DROP, onDrop);
+    return () => box.removeEventListener(SESSION_REFERENCE_DROP, onDrop);
+  }, [disabled, referencesEnabled, sessionId]);
 
   const openSessionFolderPicker = useCallback(() => {
     setSessionFolders(loadSessionFolders(cwd));
@@ -1142,7 +1438,7 @@ export function Composer({
 
     if (
       composer?.querySelector(
-        "[data-skill-picker], [data-session-folder-picker], [data-mention-picker], [data-mcp-picker], [data-composer-plus], [data-question-form]",
+        "[data-skill-picker], [data-session-folder-picker], [data-mention-picker], [data-session-reference-picker], [data-mcp-picker], [data-composer-plus], [data-question-form]",
       )
     )
       return;
@@ -1211,6 +1507,7 @@ export function Composer({
     setDraft("");
     onDraftChange?.("");
     const previous = attachmentsRef.current;
+    onSessionReferencesChange?.([]);
     for (const file of previous) {
       if (!borrowedAttachmentIdsRef.current.delete(file.id)) {
         revokeAttachment(file);
@@ -1227,7 +1524,7 @@ export function Composer({
     setSelectedMcp([]);
     syncHasValue("", []);
     ref.current?.focus();
-  }, [onDraftChange, onEditingLastTurnChange, syncHasValue]);
+  }, [onDraftChange, onEditingLastTurnChange, onSessionReferencesChange, syncHasValue]);
 
   const recallLastTurn = useCallback(() => {
     if (!editLastTurnSupported || !lastTurnRecall) return;
@@ -1240,12 +1537,14 @@ export function Composer({
       lastTurnRecall.attachments,
       new Set(lastTurnRecall.attachments.map((file) => file.id)),
     );
+    onSessionReferencesChange?.(lastTurnRecall.sessionReferences ?? []);
     setResendEdited(true);
     onEditingLastTurnChange?.(true);
   }, [
     editLastTurnSupported,
     exitEditMode,
     lastTurnRecall,
+    onSessionReferencesChange,
     onEditingLastTurnChange,
     resendEdited,
     restoreDraft,
@@ -1305,11 +1604,11 @@ export function Composer({
     if ((draftSelected || draftCommand.matched) && onSaveDraft) {
       const files = attachmentsRef.current;
       const text = draftCommand.text;
-      if (!text.trim() && files.length === 0) return;
-      const accepted = onSaveDraft(
-        mcpContextText(taggedMcpServers(text, selectedMcp), text),
-        files,
-      );
+      if (!text.trim() && files.length === 0 && !sessionReferences.length) return;
+      const draftText = mcpContextText(taggedMcpServers(text, selectedMcp), text);
+      const accepted = sessionReferences.length
+        ? onSaveDraft(draftText, files, sessionReferences)
+        : onSaveDraft(draftText, files);
       if (accepted === false || !ref.current) return;
       pasteGenerationRef.current += 1;
       ref.current.value = "";
@@ -1317,6 +1616,7 @@ export function Composer({
       setDraft("");
       onDraftChange?.("");
       setAttachments([]);
+      onSessionReferencesChange?.([]);
       setDraftSelected(false);
       setSelectedMcp([]);
       setPlusOpen(false);
@@ -1393,7 +1693,7 @@ export function Composer({
         ? `/operator ${text}`
         : text;
     const files = attachmentsRef.current;
-    if (!text && files.length === 0 && !noteCard && !handoffCard) return;
+    if (!text && files.length === 0 && !noteCard && !handoffCard && !sessionReferences.length) return;
     // Clear the parent draft before onSubmit. The app can synchronously remount
     // the composer when the first message leaves an empty session (EmptySession →
     // docked layout). If draftRef still holds the sent text, the new instance
@@ -1404,6 +1704,7 @@ export function Composer({
     );
     const resendSelectedMcp = selectedMcp;
     onDraftChange?.("");
+    onSessionReferencesChange?.([]);
     const accepted = onSubmit(
       mcpContextText(
         taggedMcpServers(submittedText, selectedMcp),
@@ -1411,6 +1712,7 @@ export function Composer({
       ),
       files,
       {
+        ...(sessionReferences.length ? { sessionReferences } : {}),
         intent:
           planSelected || command.planning
             ? "plan"
@@ -1423,6 +1725,7 @@ export function Composer({
               onResendRejected: ({ providerRewound }) => {
                 if (draftRevisionRef.current !== resendDraftRevision) return;
                 restoreDraft(text, files, resendBorrowedAttachmentIds);
+                onSessionReferencesChange?.(sessionReferences);
                 setSelectedMcp(resendSelectedMcp);
                 setResendEdited(!providerRewound);
                 onEditingLastTurnChange?.(!providerRewound);
@@ -1436,6 +1739,7 @@ export function Composer({
     // intact so resolving the blocker never destroys their work.
     if (accepted === false) {
       restoreDraft(text, files);
+      onSessionReferencesChange?.(sessionReferences);
       return;
     }
     pasteGenerationRef.current += 1;
@@ -1492,6 +1796,81 @@ export function Composer({
       e.preventDefault();
       openSessionFolderPicker();
       return;
+    }
+
+    if (sessionPickerOpen) {
+      const items = sessionPicker.items;
+      const total = sessionOptionCount;
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && sessionContentRow) {
+        e.preventDefault();
+        setSessionSearch("content");
+        return;
+      }
+      if (e.key === "ArrowDown" || e.key === "PageDown") {
+        e.preventDefault();
+        if (total === 0 || !sessionReadyKey) return;
+        const last = items.length - 1;
+        if (
+          e.key === "ArrowDown" &&
+          sessionActive === last &&
+          sessionPicker.hasMore
+        ) {
+          // Keep walking past the loaded page once the next one arrives.
+          advanceSessionActiveRef.current = true;
+          sessionPicker.loadMore();
+          return;
+        }
+        const target =
+          e.key === "PageDown"
+            ? Math.min(sessionActive + 8, total - 1)
+            : sessionActive + 1 >= total
+              ? 0
+              : sessionActive + 1;
+        if (target >= last && sessionPicker.hasMore) sessionPicker.loadMore();
+        setSessionActive(target);
+        return;
+      }
+      if (e.key === "ArrowUp" || e.key === "PageUp") {
+        e.preventDefault();
+        if (total === 0 || !sessionReadyKey) return;
+        setSessionActive((index) =>
+          e.key === "PageUp"
+            ? Math.max(index - 8, 0)
+            : index <= 0
+              ? total - 1
+              : index - 1,
+        );
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (sessionSearch === "content") {
+          setSessionSearch("title");
+          return;
+        }
+        const start = sessionTokenRef.current?.start ?? null;
+        updateSessionToken(null);
+        dismissedSessionTokenRef.current = start;
+        return;
+      }
+      const pick =
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.ctrlKey;
+      // Only a row actually selected in the current results takes Enter/Tab;
+      // while loading, with no results or nothing selected they keep their
+      // usual meaning.
+      if (
+        pick &&
+        sessionReadyKey &&
+        sessionActive >= 0 &&
+        sessionActive < total
+      ) {
+        e.preventDefault();
+        pickSessionOption(sessionActive);
+        return;
+      }
     }
 
     if (mentionOpen) {
@@ -1888,6 +2267,31 @@ export function Composer({
             />
           </div>
         ) : null}
+        {sessionPickerOpen && !pickerOpen ? (
+          <div className="absolute inset-x-0 bottom-full z-30 mb-1">
+            <SessionReferencePicker
+              id={sessionPickerId}
+              scope={sessionToken.scope}
+              search={sessionSearch}
+              query={sessionToken.query}
+              items={sessionPicker.items}
+              ready={sessionPicker.ready}
+              loading={sessionPicker.loading}
+              hasMore={sessionPicker.hasMore}
+              error={sessionPicker.error}
+              active={sessionActive}
+              referencedIds={referencedIds}
+              onActive={setSessionActive}
+              onPick={pickSessionOption}
+              onScope={changeSessionScope}
+              onSearchTitles={() => {
+                setSessionSearch("title");
+                ref.current?.focus();
+              }}
+              onLoadMore={sessionPicker.loadMore}
+            />
+          </div>
+        ) : null}
         {mentionOpen && !pickerOpen ? (
           <div className="absolute inset-x-0 bottom-full z-30 mb-1">
             <FileMentionPicker
@@ -1907,8 +2311,11 @@ export function Composer({
         <div
           ref={boxRef}
           data-composer-box
+          data-session-reference-target={
+            referencesEnabled && !disabled ? sessionId : undefined
+          }
           data-composer-editing={resendEdited ? "" : undefined}
-          className={`relative z-10 border bg-content/3 backdrop-blur-sm ${
+          className={`group/composer-box relative z-10 border bg-content/3 backdrop-blur-sm data-[session-reference-over=true]:border-accent/60 ${
             resendEdited
               ? "edit-last-turn-composer rounded-lg"
               : "rounded-lg border-content/10 has-focus:border-content/20"
@@ -1923,6 +2330,11 @@ export function Composer({
           {fileDrag ? (
             <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center rounded-lg bg-accent/8 text-[12px] text-content/70">
               Drop files to attach
+            </div>
+          ) : null}
+          {referencesEnabled ? (
+            <div className="pointer-events-none absolute inset-0 z-20 hidden place-items-center rounded-lg bg-accent/8 text-[12px] text-content/70 group-data-[session-reference-over=true]/composer-box:grid">
+              Drop to reference this session
             </div>
           ) : null}
           {hideTopBar ? null : (
@@ -2016,6 +2428,16 @@ export function Composer({
             </div>
           ) : null}
 
+          {sessionReferences.length > 0 ? (
+            <SessionReferenceChips
+              references={sessionReferences}
+              onRemove={
+                onSessionReferencesChange ? removeSessionReference : undefined
+              }
+              className="max-h-[4.75rem] overflow-y-auto px-3 pt-2"
+            />
+          ) : null}
+
           {pasteError ? (
             <p role="alert" className="px-3 pt-2 text-xs text-red-400">
               {pasteError}
@@ -2072,11 +2494,19 @@ export function Composer({
                       : handoffCard
                         ? "Add context, or send to continue…"
                         : (placeholder ??
-                          (shell
-                            ? "Ask, build, / for commands, @ for references... "
-                            : "Ask, build, / for commands, @ for references... "))
+                          (referencesEnabled
+                            ? "Ask, build, / for commands, @ for files, # for sessions... "
+                            : shell
+                              ? "Ask, build, / for commands, @ for references... "
+                              : "Ask, build, / for commands, @ for references... "))
               }
               aria-label={inputAriaLabel}
+              aria-controls={sessionPickerOpen ? sessionPickerId : undefined}
+              aria-activedescendant={
+                sessionPickerOpen && sessionActive >= 0
+                  ? sessionPickerOptionId(sessionPickerId, sessionActive)
+                  : undefined
+              }
               disabled={disabled}
               className={`composer-field scrollbar-none relative max-h-40 w-full resize-none overflow-x-hidden whitespace-pre-wrap wrap-break-word bg-transparent px-3 text-sm leading-5.5 outline-none placeholder:overflow-hidden placeholder:text-ellipsis placeholder:whitespace-nowrap font-sans ${
                 shell ? "py-4" : "py-3"
@@ -2088,6 +2518,13 @@ export function Composer({
               onClick={(e) => syncTokensFromTextarea(e.currentTarget)}
               onKeyUp={(e) => syncTokensFromTextarea(e.currentTarget)}
               onSelect={(e) => syncTokensFromTextarea(e.currentTarget)}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={(e) => {
+                composingRef.current = false;
+                syncTokensFromTextarea(e.currentTarget);
+              }}
               onInput={(e) => {
                 const el = e.currentTarget;
                 if (enterBtwFromPrefix(el)) return;

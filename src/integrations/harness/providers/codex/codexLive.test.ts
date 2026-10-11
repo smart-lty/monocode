@@ -66,7 +66,7 @@ import {
   type RuntimeMode,
   type TurnIntent,
 } from "../../../../features/sessions/model/session";
-import { applyHarnessEvent } from "../../core/apply";
+import { appendUser, applyHarnessEvent } from "../../core/apply";
 
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -116,6 +116,7 @@ async function startTurn(
     resumeProviderAccountId?: string;
     expectResume?: boolean;
     beforeThreadReply?: () => Promise<void>;
+    beforeTurnReply?: () => Promise<void>;
     onAccepted?: () => void;
     controlsAgents?: boolean;
     ephemeral?: boolean;
@@ -168,6 +169,7 @@ async function startTurn(
     () => parse().some((m) => m.method === "turn/start"),
     "turn/start",
   );
+  await options.beforeTurnReply?.();
   reply(parse().find((m) => m.method === "turn/start")!.id as number, {
     turn: { id: "turn_1", status: "inProgress" },
   });
@@ -193,6 +195,118 @@ describe("codex live turn sequence", () => {
     await stopCodexSession("codex-live");
     __codexTestReset();
   });
+
+  it("interrupts the old native turn and rejects late completion when cancellation preceded its first turn/start reply", async () => {
+    const { events, turn } = await startTurn("codex-live", {
+      beforeTurnReply: async () => {
+        await cancelCodexTurn("codex-live");
+        expect(parse().some((message) => message.method === "turn/interrupt")).toBe(false);
+      },
+    });
+    expect(events).toContainEqual({ type: "turn.cancelled" });
+    expect(events.some((event) => event.type === "turn.started")).toBe(false);
+    await waitFor(() => parse().some((message) => message.method === "turn/interrupt"), "late-bound old native interrupt");
+    const interrupt = parse().find((message) => message.method === "turn/interrupt")!;
+    expect(interrupt.params).toEqual({ threadId: "thr_1", turnId: "turn_1" });
+    const nextEvents: HarnessEvent[] = [];
+    let settled = false;
+    const next = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4",
+      runtimeMode: "supervised", text: "Next turn", onEvent: (event) => nextEvents.push(event) });
+    void next.then(() => { settled = true; }, () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(parse().filter((message) => message.method === "turn/start")).toHaveLength(1);
+    reply(interrupt.id as number, {});
+    await turn;
+    await waitFor(() => parse().filter((message) => message.method === "turn/start").length === 2, "next turn/start before reply");
+    const secondStart = parse().filter((message) => message.method === "turn/start")[1];
+    const beforeLate = [...nextEvents];
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    notify("item/agentMessage/delta", { threadId: "thr_1", turnId: "turn_1", itemId: "old-message", delta: "LATE-WRONG" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(nextEvents).toEqual(beforeLate);
+    expect(settled).toBe(false);
+    reply(secondStart.id as number, { turn: { id: "turn_2" } });
+    notify("turn/started", { threadId: "thr_1", turn: { id: "turn_2", status: "inProgress" } });
+    await waitFor(() => nextEvents.some((event) => event.type === "turn.started" && event.providerTurnId === "turn_2"), "new native turn binding");
+    notify("item/agentMessage/delta", { threadId: "thr_1", turnId: "turn_2", itemId: "next-message", delta: "NEXT-OK" });
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_2", status: "completed" } });
+    await next;
+    expect(nextEvents).toContainEqual({ type: "turn.started", providerTurnId: "turn_2" });
+    expect(nextEvents).toContainEqual({ type: "message.delta", text: "NEXT-OK" });
+  });
+
+  it.each(["stop", "abort", "failed"] as const)(
+    "settles %s with partial output and rejects its late events during the next native turn",
+    async (ending) => {
+      const { events, turn } = await startTurn("codex-live");
+      notify("item/started", { threadId: "thr_1", turnId: "turn_1", item: {
+        id: "sleep", type: "commandExecution", command: "sleep 60", status: "inProgress",
+      } });
+      onLine!(JSON.stringify({ id: 91, method: "item/commandExecution/requestApproval",
+        params: { threadId: "thr_1", turnId: "turn_1", itemId: "sleep", command: "sleep 60" } }));
+      await waitFor(() => events.some((event) => event.type === "approval.requested"), "sleep approval");
+      const approval = events.find((event) => event.type === "approval.requested")!;
+      respondCodexApproval("codex-live", approval.requestId, "allow");
+      await waitFor(() => parse().some((message) => message.id === 91), "sleep allowed");
+      notify("item/agentMessage/delta", { threadId: "thr_1", turnId: "turn_1", itemId: "partial", delta: "PARTIAL-KEEP" });
+      if (ending === "stop") {
+        const cancel = cancelCodexTurn("codex-live");
+        await waitFor(() => parse().some((message) => message.method === "turn/interrupt"), "native interrupt");
+        const interrupt = parse().find((message) => message.method === "turn/interrupt")!;
+        expect(interrupt.params).toEqual({ threadId: "thr_1", turnId: "turn_1" });
+        reply(interrupt.id as number, {});
+        await cancel;
+      } else {
+        notify(ending === "abort" ? "turn/aborted" : "turn/completed", {
+          threadId: "thr_1", turn: { id: "turn_1", status: ending === "abort" ? "interrupted" : "failed",
+            ...(ending === "failed" ? { error: { message: "Connection lost" } } : {}) },
+        });
+      }
+      await turn;
+      const session = events.reduce(applyHarnessEvent, appendUser(newSession("codex", "/repo"), "Cancelable child"));
+      const terminal = ending === "failed" ? "error" : "cancelled";
+      expect(session.blocks[0]).toMatchObject({ turnOutcome: terminal });
+      expect(session.blocks.find((block) => block.tool?.callId === "sleep")).toMatchObject({
+        streaming: false, tool: { status: ending === "failed" ? "failed" : "cancelled" }, approval: { decided: "allow" },
+      });
+      expect(session.blocks.find((block) => block.text === "PARTIAL-KEEP")).toMatchObject({ streaming: false });
+      const endedSnapshot = JSON.stringify(session);
+      const nextEvents: HarnessEvent[] = [];
+      let nextSettled = false;
+      const next = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4",
+        runtimeMode: "supervised", text: "Independent next turn", onEvent: (event) => nextEvents.push(event) });
+      void next.then(() => { nextSettled = true; }, () => undefined);
+      await waitFor(() => parse().filter((message) => message.method === "turn/start").length === 2, "next native turn");
+      const start = parse().filter((message) => message.method === "turn/start")[1];
+      // Old snapshots can arrive before the new turn/start reply, too.
+      const beforeReply = [...nextEvents];
+      notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+      expect(nextEvents).toEqual(beforeReply);
+      reply(start.id as number, { turn: { id: "turn_2" } });
+      notify("turn/started", { threadId: "thr_1", turn: { id: "turn_2", status: "inProgress" } });
+      await waitFor(() => nextEvents.some((event) => event.type === "turn.started" && event.providerTurnId === "turn_2"), "next turn binding");
+      const beforeLate = [...nextEvents];
+      notify("turn/started", { threadId: "thr_1", turn: { id: "turn_1" } });
+      notify("item/agentMessage/delta", { threadId: "thr_1", turnId: "turn_1", itemId: "partial", delta: "LATE-WRONG" });
+      notify("item/completed", { threadId: "thr_1", turnId: "turn_1", item: {
+        id: "sleep", type: "commandExecution", command: "sleep 60", status: "completed", exitCode: 0,
+      } });
+      notify("turn/aborted", { threadId: "thr_1", turn: { id: "turn_1", status: "interrupted" } });
+      notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "failed", error: { message: "LATE-WRONG" } } });
+      onLine!(JSON.stringify({ id: 93, method: "item/commandExecution/requestApproval",
+        params: { threadId: "thr_1", turnId: "turn_1", itemId: "sleep", command: "sleep 60" } }));
+      await waitFor(() => parse().some((message) => message.id === 93), "stale request declined");
+      expect(parse().find((message) => message.id === 93)?.result).toEqual({ decision: "decline" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(nextSettled).toBe(false);
+      expect(nextEvents).toEqual(beforeLate);
+      expect(JSON.stringify(session)).toBe(endedSnapshot);
+      notify("item/agentMessage/delta", { threadId: "thr_1", turnId: "turn_2", itemId: "next-message", delta: "NEXT-OK" });
+      notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_2", status: "completed" } });
+      await next;
+      expect(nextEvents).toContainEqual({ type: "message.delta", text: "NEXT-OK" });
+    },
+  );
 
   it("reports when the provider accepts a turn", async () => {
     const onAccepted = vi.fn();

@@ -128,6 +128,23 @@ describe("BTW conversation", () => {
     expect(container.querySelector("[data-btw-overlay]")).toBeNull();
   });
 
+  it.each(["cancelled", "error"] as const)("rejects a timed %s turn and keeps the latest truly completed turn available", async (turnOutcome) => {
+    const first = session();
+    const cancelled: Block[] = [
+      { id: "u2", role: "user", text: "unfinished", durationMs: 28_000, turnOutcome },
+      { id: "a2", role: "assistant", text: "partial" },
+    ];
+    const onSubmit = vi.fn();
+    await render({ blocks: [...first, ...cancelled], onSubmit, busy: true });
+    expect(btw.unavailableAt(cancelled)).toBe("This turn hasn’t finished yet.");
+    expect(btw.unavailableAt(first)).toBeUndefined();
+    await act(async () => void btw.openAt(cancelled));
+    expect(btw.open).toBe(false);
+    expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => void btw.openWith("Check the completed turn"));
+    expect(onSubmit).toHaveBeenCalledWith(first, expect.any(String), expect.any(String), "Check the completed turn", undefined, {});
+  });
+
   it("opens an empty tab for a bare /btw without sending", async () => {
     const onSubmit = vi.fn();
     await render({ onSubmit });

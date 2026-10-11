@@ -17,6 +17,7 @@ import {
   generateCodexPrContent,
 } from "./codexGit";
 import { refreshCodexCatalog } from "./codexCatalog";
+import { forkCodexSession } from "./codexFork";
 import { generateCodexSessionTitle } from "./codexTitle";
 import {
   runCodexTextPrompt,
@@ -31,6 +32,7 @@ import {
 
 export const codexAdapter: HarnessAdapter = {
   id: "codex",
+  forkSession: forkCodexSession,
   live: true,
   sendTurn: sendCodexTurn,
   compactContext: compactCodexContext,
